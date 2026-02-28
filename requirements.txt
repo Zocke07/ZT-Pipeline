@@ -1,0 +1,6 @@
+flwr==1.13.1
+grpcio>=1.62.0
+cryptography>=42.0.0
+torch==2.5.1
+torchvision==0.20.1
+numpy<2

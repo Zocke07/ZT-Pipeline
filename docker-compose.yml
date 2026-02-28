@@ -1,0 +1,159 @@
+# ──────────────────────────────────────────────────────────────
+#  ZT-Pipeline – Full Zero-Trust FL (Gate 1 + Gate 2 + Gate 3)
+#
+#  Gate 1: mTLS Identity Verification   (./certs)
+#  Gate 2: Model Update Signing         (./signing_keys)
+#  Gate 3: Behavioural Anomaly Detection (delta cosine similarity)
+#
+#  Default services (no profile needed):
+#    server     – Flower server (ZeroTrustFedAvg strategy, 2 clients)
+#    client-0   – Honest edge device 0
+#    malicious  – Label-Flipping attacker (CLIENT_ID=1)
+#                 Passes Gates 1+2; caught by Gate 3 (anti-correlated deltas)
+#
+#  Profiles:
+#    clean      – Replace malicious with honest client-1 (baseline test)
+#               docker compose --profile clean up server client-0 client-1
+#
+#  GPU:  Every container gets access to all GPUs.
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ── Data initialiser ─────────────────────────────────────
+  # Downloads CIFAR-10 once into the shared volume before any
+  # client starts, eliminating the parallel-download race condition.
+  data-init:
+    build: .
+    container_name: fl-data-init
+    command: >
+      python -c "from torchvision import datasets, transforms;
+      datasets.CIFAR10('/data', train=True,  download=True,
+        transform=transforms.ToTensor());
+      datasets.CIFAR10('/data', train=False, download=True,
+        transform=transforms.ToTensor());
+      print('CIFAR-10 ready.')"
+    volumes:
+      - cifar-data:/data
+    restart: "no"
+
+  # ── Flower Server ────────────────────────────────────────
+  server:
+    build: .
+    container_name: fl-server
+    command: python server.py
+    ports:
+      - "8080:8080"
+    environment:
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+      - NUM_CLIENTS=2
+      - MIN_CLIENTS=2
+      - ANOMALY_Z_THRESHOLD=2.0
+    volumes:
+      - ./certs:/certs:ro
+      - ./signing_keys:/signing_keys:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Client 0 ─────────────────────────────────────────────
+  client-0:
+    build: .
+    container_name: fl-client-0
+    command: >
+      sh -c "sleep 5 && python client.py"
+    environment:
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+    volumes:
+      - cifar-data:/data
+      - ./certs:/certs:ro
+      - ./signing_keys:/signing_keys:ro
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Malicious Client (Label Flipping Attack) ─────────────
+  # Always-on: the default experiment is 1 honest + 1 malicious.
+  # Passes Gate 1 (valid cert) and Gate 2 (valid signature).
+  # Gate 3 detects anti-correlated deltas and rejects this client.
+  malicious:
+    build: .
+    container_name: fl-malicious
+    command: >
+      sh -c "sleep 12 && python client_malicious.py"
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+      - ATTACK_MODE=label_flip
+      - LOCAL_EPOCHS=2
+    volumes:
+      - cifar-data:/data
+      - ./certs:/certs:ro
+      - ./signing_keys:/signing_keys:ro
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Client 1 (Honest – baseline profile only) ────────────
+  # Used for the clean 2-honest-client baseline test:
+  #   docker compose --profile clean up server client-0 client-1
+  client-1:
+    build: .
+    container_name: fl-client-1
+    profiles: ["clean"]
+    command: >
+      sh -c "sleep 5 && python client.py"
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+    volumes:
+      - cifar-data:/data
+      - ./certs:/certs:ro
+      - ./signing_keys:/signing_keys:ro
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  cifar-data:
