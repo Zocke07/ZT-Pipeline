@@ -1,0 +1,17 @@
+# ──────────────────────────────────────────────────────────────
+#  Experiment B override – Zero-Trust under attack
+#
+#  Layered on top of docker-compose.yml via:
+#    docker compose -f docker-compose.yml \
+#                   -f experiment_override.yml up ...
+#
+#  Changes:
+#    MIN_ACCEPTED=1  (allow aggregation with a single honest client
+#                     after Gate 3 rejects the attacker, so we can
+#                     measure whether the model still learns correctly)
+# ──────────────────────────────────────────────────────────────
+
+services:
+  server:
+    environment:
+      - MIN_ACCEPTED=1

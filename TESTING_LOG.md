@@ -197,11 +197,11 @@ docker compose down -v   # cleanup
 
 | File | Change |
 |------|--------|
-| `signing.py` | New – RSA key generation, `sign_parameters()`, `verify_signature()`, `serialize_parameters()` |
+| `signing.py` | New – RSA key generation, `sign_parameters()`, `verify_signature()`, `serialize_parameters()`. Post-audit: now accepts `server_round` kwarg for replay protection; catches only `InvalidSignature` instead of broad `Exception`. |
 | `generate_signing_keys.sh` | New – generates 2048-bit RSA key pairs per client |
-| `server.py` | Replaced `FedAvg` with `VerifiedFedAvg` – overrides `aggregate_fit()` to verify signatures before aggregation; rejects unsigned/tampered/unknown updates |
-| `client.py` | `fit()` now signs weight updates with client's RSA private key; attaches `signature` + `client_id` in metrics dict |
-| `docker-compose.yml` | Mounts `./signing_keys:/signing_keys:ro` into all containers; adds `SIGNING_KEY_DIR` + `NUM_CLIENTS` env vars |
+| `server.py` | Replaced `FedAvg` with `ZeroTrustFedAvg` – overrides `aggregate_fit()` to verify signatures before aggregation; rejects unsigned/tampered/unknown updates. Post-audit: deny-by-default, `min_accepted` quorum, replay-protection via `server_round`. |
+| `client.py` | `fit()` now signs weight updates with client's RSA private key; attaches `signature` + `client_id` in metrics dict. Post-audit: mandatory signing (crashes without key), passes `server_round` for replay protection, AMP mixed precision, `torch.compile`. |
+| `docker-compose.yml` | Mounts `./signing_keys` into containers; adds `SIGNING_KEY_DIR` + `NUM_CLIENTS` env vars. Post-audit: least-privilege per-file mounts (server gets only public keys, each client gets only its own private key). |
 | `requirements.txt` | Added `cryptography>=42.0.0` |
 | `Dockerfile` | `COPY` step now includes `signing.py` |
 
@@ -443,7 +443,496 @@ docker compose --profile clean up --abort-on-container-exit server client-0 clie
 
 ---
 
-## Phase 5 – *(pending)*
+## Phase 5 – Security Hardening & GPU Optimisation (Post-Audit)
+
+**Date:** 2026-03-01  
+**Status:** ✅ APPLIED — code changes committed, awaiting re-test
+
+### Objective
+
+Apply the findings from a comprehensive security audit covering three criteria:
+1. **Security flaws** — hardcoded fallbacks, broad exception handling, replay attacks, over-provisioned secrets
+2. **Thesis alignment** — enforce the "never trust, always verify" posture consistently across all components
+3. **GPU optimisation** — exploit NVIDIA RTX 4000 Ada Tensor Cores through mixed precision, TF32, memory pinning, and graph compilation
+
+### Changes Applied
+
+#### Security Fixes
+
+| ID | File(s) | Before | After | Thesis Defence Sentence |
+|----|---------|--------|-------|------------------------|
+| **S1** | `server.py`, `client.py` | Server and clients silently fall back to insecure plaintext gRPC when certs are missing | Both raise `RuntimeError` and refuse to start — **deny-by-default** | _"The system enforces a deny-by-default posture: no entity can participate without valid mTLS credentials."_ |
+| **S3** | `signing.py` | `except Exception` masks all errors as invalid signatures | `except InvalidSignature` — only `cryptography.exceptions.InvalidSignature` is caught | _"By catching only InvalidSignature, programming bugs surface immediately rather than being misclassified."_ |
+| **S4** | `docker-compose.yml` | `./signing_keys:/signing_keys:ro` mounted to every container (server + all clients) | Server mounts only `*.public.pem`; each client mounts only its own `*.private.pem` — **least privilege** | _"Each container receives only the cryptographic material it needs, enforcing least privilege at the infrastructure layer."_ |
+| **S5** | `signing.py`, `server.py`, `client.py`, `client_malicious.py`, `poisoned_client.py` | Signatures cover only weight bytes — no freshness binding | `server_round` (4-byte big-endian nonce) prepended to signed payload — **replay protection** | _"Signatures bind to the federation round, preventing replay of captured updates."_ |
+| **S6** | `client.py` | Missing signing key → client participates unsigned | Missing signing key → `RuntimeError` — client **refuses to start** | _"Unsigned clients cannot participate, eliminating the possibility of unauthenticated model updates."_ |
+
+#### Thesis Alignment Fixes
+
+| ID | File(s) | Before | After | Impact |
+|----|---------|--------|-------|--------|
+| **T3** | `server.py` | If Gate 3 rejects all but 1 client, that single client's update becomes the global model | `min_accepted` guard: aggregation is skipped if fewer than `MIN_ACCEPTED` updates survive all gates | Prevents single-client model domination — an attacker who times participation cannot isolate themselves as the sole contributor |
+
+#### GPU Optimisation
+
+| ID | File(s) | Change | Expected Impact |
+|----|---------|--------|----------------|
+| **G1** | `client.py`, `client_malicious.py`, `poisoned_client.py` | `torch.tensor(v)` → `torch.from_numpy(np.array(v))` | Zero-copy memory sharing; preserves dtype |
+| **G2** | `client.py` | Added `torch.amp.autocast("cuda")` + `torch.amp.GradScaler` | FP16 on Tensor Cores: ~2× training throughput |
+| **G3** | `client.py` | Added `pin_memory=True` + `persistent_workers=True` on DataLoaders | Faster async CPU→GPU transfer via `non_blocking=True` |
+| **G4** | `client.py` | Added `torch.compile(model)` when CUDA available | PyTorch 2.x Inductor backend: fused ops, reduced kernel launches |
+| **G5** | `client.py`, `client_malicious.py`, `poisoned_client.py` | Added `torch.backends.cuda.matmul.allow_tf32 = True` | TF32 matmul format: 3× FLOPS vs FP32 on Ampere+ GPUs |
+| **G6** | `client.py` | `optimizer.zero_grad()` → `optimizer.zero_grad(set_to_none=True)` | Avoids memset; marginal speedup per iteration |
+
+### New Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MIN_ACCEPTED` | `2` | Minimum updates surviving Gates 2+3 for aggregation to proceed |
+
+### New Server Callback
+
+```python
+on_fit_config_fn=lambda server_round: {"server_round": server_round}
+```
+
+Passes the round number to clients so they can include it in the signed payload (replay protection).
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `signing.py` | Import `InvalidSignature`; `sign_parameters()` and `verify_signature()` accept `server_round` kwarg; round nonce prepended to digest; catch narrowed to `InvalidSignature` |
+| `server.py` | `_load_certificates()` raises `RuntimeError` on missing certs; `ZeroTrustFedAvg.__init__()` accepts `min_accepted`; `aggregate_fit()` passes `server_round` to verify; minimum accepted guard added; `on_fit_config_fn` lambda added |
+| `client.py` | Added `numpy` import; TF32 + float32 precision config; `train_one_epoch` uses AMP scaler; `evaluate` uses `autocast`; `CifarClient.__init__` adds `torch.compile`, `GradScaler`, `pin_memory`, `persistent_workers`; signing key and mTLS are mandatory (`RuntimeError`); `fit()` passes `server_round`; `set_parameters` uses `torch.from_numpy`; `main()` deny-by-default for mTLS |
+| `client_malicious.py` | TF32 config; `set_parameters` uses `torch.from_numpy`; `fit()` passes `server_round` to `sign_parameters` |
+| `poisoned_client.py` | TF32 config; `set_parameters` uses `torch.from_numpy`; `fit()` passes `server_round` to `sign_parameters` |
+| `docker-compose.yml` | Server mounts only `*.public.pem`; client-0 mounts only `client-0.private.pem`; malicious mounts only `client-1.private.pem`; client-1 (clean profile) mounts only `client-1.private.pem`; added `MIN_ACCEPTED=2` env var |
+
+### Expected Verification Plan
+
+After rebuilding Docker images, the following tests should confirm the changes:
+
+| Test | Command | Expected Result |
+|------|---------|----------------|
+| **Normal operation** | `docker compose up --abort-on-container-exit server client-0 malicious` | Gates 1+2 pass for both; Gate 3 detects anti-correlated deltas in round 2–3; malicious rejected; logs show `[signed ✓, round=N]` |
+| **Missing cert** | Remove `certs/client-0.crt`, run client-0 | Client-0 crashes with `RuntimeError` (never connects) |
+| **Missing signing key** | Remove `client-0.private.pem` from mount | Client-0 crashes with `RuntimeError` (never trains) |
+| **Replay attack** | Re-send round 1 signature in round 2 | Verification fails because `server_round` differs |
+| **Single-client domination** | Run with only 1 client, `MIN_ACCEPTED=2` | Server logs: _"Only 1 update(s) survived... skipping aggregation"_ |
+| **Clean baseline** | `docker compose --profile clean up --abort-on-container-exit server client-0 client-1` | Both honest, all pass, accuracy ~70% |
+
+### Observations
+
+- All changes are backwards-compatible with the existing PKI and signing key infrastructure — no key regeneration required.
+- The replay protection nonce defaults to `server_round=0` when not provided, so legacy unsigned-round-0 behaviour is preserved during testing.
+- GPU optimisations (AMP, TF32, torch.compile) are gated on `DEVICE.type == "cuda"` — the code still works on CPU-only machines with no Tensor Core features enabled.
+
+### How to Reproduce
+
+```powershell
+# Rebuild images with updated code
+docker compose build
+
+# Run default experiment (1 honest + 1 malicious)
+docker compose up data-init
+docker compose up --abort-on-container-exit server client-0 malicious
+
+# Run clean baseline (2 honest)
+docker compose --profile clean up --abort-on-container-exit server client-0 client-1
+
+# Cleanup
+docker compose down -v
+```
+
+---
+
+## Phase 6 – GPU Environment Verification (Pre-Flight Check)
+
+**Date:** 2026-03-01  
+**Status:** ✅ PASSED — all checks green
+
+### Objective
+
+Before running any further experiments, verify end-to-end that the host GPU is accessible from within Docker containers running on WSL2. This eliminates "could not select device driver" or "nvidia-container-cli: initialization error" surprises mid-experiment.
+
+### Host Environment
+
+| Item | Detail |
+|------|--------|
+| OS | Windows 11 (WSL2 with Ubuntu 22.04) |
+| GPU | NVIDIA GeForce RTX 4050 Laptop GPU (Ada Lovelace, 6 GB VRAM) |
+| Host Driver | NVIDIA `591.86` (Windows-side) |
+| CUDA Version | `13.1` (driver-reported) |
+| Docker | Docker Desktop with WSL2 backend |
+| Container Toolkit | NVIDIA Container Toolkit (`nvidia` runtime registered) |
+
+### Check 1 — `nvidia-smi` on host (Windows / WSL2)
+
+```
+> nvidia-smi
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 591.86         Driver Version: 591.86         CUDA Version: 13.1             |
+| GPU 0: NVIDIA GeForce RTX 4050 Laptop GPU                                              |
+|   50°C   P5   8W / 140W   664MiB / 6141MiB   16%  Default                              |
++-----------------------------------------------------------------------------------------+
+```
+
+**Result:** ✅ GPU detected, driver loaded, CUDA 13.1 available.
+
+### Check 2 — Docker GPU passthrough (`--gpus all`)
+
+```
+> docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.57         Driver Version: 591.86         CUDA Version: 13.1             |
+| GPU 0: NVIDIA GeForce RTX 4050 Laptop GPU                                              |
+|   49°C   P5   8W / 140W   663MiB / 6141MiB   19%  Default                              |
++-----------------------------------------------------------------------------------------+
+```
+
+**Result:** ✅ Docker container sees the GPU via NVIDIA Container Toolkit.
+
+### Check 3 — GPU device listing inside container
+
+```
+> docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L
+GPU 0: NVIDIA GeForce RTX 4050 Laptop GPU (UUID: GPU-4db5db7a-df1b-9ee5-4647-c5243a0d4a45)
+```
+
+**Result:** ✅ Single GPU enumerated with correct UUID.
+
+### Check 4 — NVIDIA runtime registered in Docker
+
+```
+> docker info | Select-String "Runtimes"
+Runtimes: io.containerd.runc.v2 nvidia runc
+Default Runtime: runc
+```
+
+**Result:** ✅ `nvidia` runtime is available alongside the default `runc`.
+
+### Docker Compose GPU Configuration
+
+The project's `docker-compose.yml` requests GPU access via the `deploy.resources.reservations` block:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+```
+
+This is applied to `server`, `client-0`, `client-1`, and `malicious` services.
+
+### Troubleshooting Guide
+
+If any of the above checks fail, here are the exact fixes:
+
+#### Error: `could not select device driver "" with capabilities: [[gpu]]`
+
+**Cause:** NVIDIA Container Toolkit is not installed or not configured for Docker.
+
+**Fix (run inside WSL2 Ubuntu):**
+
+```bash
+# 1. Add the NVIDIA Container Toolkit repository
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# 2. Install the toolkit
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+
+# 3. Configure Docker to use the nvidia runtime
+sudo nvidia-ctk runtime configure --runtime=docker
+
+# 4. Restart Docker
+sudo systemctl restart docker
+# (or restart Docker Desktop from the Windows system tray)
+
+# 5. Verify
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+#### Error: `nvidia-container-cli: initialization error: nvml error: driver not loaded`
+
+**Cause:** The NVIDIA Windows driver is not being forwarded into WSL2.
+
+**Fix:**
+
+1. **Update the NVIDIA Windows driver** to the latest Game Ready / Studio driver from [nvidia.com/drivers](https://www.nvidia.com/drivers).
+2. **Do NOT install a separate CUDA driver inside WSL2** — WSL2 uses the Windows host driver via `/usr/lib/wsl/lib/`.
+3. Ensure WSL2 is up to date:
+   ```powershell
+   wsl --update
+   wsl --shutdown
+   # Then reopen your WSL2 terminal
+   ```
+4. Verify the driver library exists inside WSL2:
+   ```bash
+   ls -la /usr/lib/wsl/lib/libcuda.so*
+   # Should show libcuda.so.1 symlink
+   ```
+
+#### Error: `docker: Error response from daemon: OCI runtime create failed`
+
+**Cause:** Mismatch between NVIDIA Container Toolkit version and Docker runtime config.
+
+**Fix:**
+
+```bash
+# Reconfigure the runtime
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# If using Docker Desktop, also toggle:
+#   Settings → Docker Engine → add "nvidia" to runtimes if missing
+```
+
+#### Error: `CUDA error: no kernel image is available for execution on the device`
+
+**Cause:** The CUDA toolkit version in the container image doesn't support the GPU's compute capability.
+
+**Fix:** The RTX 4050 (Ada Lovelace) has compute capability `8.9`. Ensure the container image uses CUDA `≥ 11.8`. The project uses `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` which fully supports Ada Lovelace.
+
+### Observations
+
+- The Windows-side driver (`591.86`) is automatically forwarded into WSL2 — no separate GPU driver installation is needed inside WSL2.
+- The in-container SMI reports driver `590.57` (the Linux-compatible shim), while the actual Windows driver is `591.86`. This version mismatch is normal and expected in WSL2.
+- CUDA 13.1 (driver-level) is backwards-compatible with the project's `nvidia/cuda:12.4.1` container image.
+- The project's `docker-compose.yml` uses `deploy.resources.reservations.devices` with `driver: nvidia`, which is the correct Docker Compose v2 syntax for GPU access.
+- All four FL containers (server, client-0, client-1/malicious) request GPU access, ensuring PyTorch can use `torch.device("cuda")` throughout training.
+
+### How to Reproduce
+
+```powershell
+# Host-side GPU check
+nvidia-smi
+
+# Docker GPU passthrough test
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# GPU device listing
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L
+
+# Docker runtime check
+docker info | Select-String "Runtimes"
+```
+
+---
+
+## Phase 7 – Full End-to-End Simulation (Post-Hardening Re-Test)
+
+**Date:** 2026-03-01  
+**Status:** ✅ PASSED — all 3 gates working, attacker detected in round 3
+
+### Objective
+
+Run the complete Zero-Trust Federated Learning simulation from scratch after the Phase 5 security hardening and Phase 6 environment verification. Confirm that all three gates work end-to-end with the GPU-optimised codebase (`torch.compile`, AMP, TF32).
+
+### Bug Fix Applied During This Phase
+
+| File | Issue | Fix |
+|------|-------|-----|
+| `Dockerfile` | `torch.compile()` (Phase 5 GPU optimisation) invokes Triton JIT, which requires a C compiler. The runtime image lacked `gcc`, causing `RuntimeError: Failed to find C compiler` on client-0's first training call. | Added `gcc` to `apt-get install` in the Dockerfile. |
+
+### Setup
+
+| Item | Detail |
+|------|--------|
+| Framework | Flower `1.13.1` + PyTorch `2.5.1` + TorchVision `0.20.1` |
+| Strategy | `ZeroTrustFedAvg` (Gate 2 + Gate 3, `MIN_ACCEPTED=2`) |
+| Dataset | CIFAR-10 (IID partition, 25 000 samples/client) |
+| Model | `CifarCNN` – 3 × Conv → 2 × FC → 10 classes |
+| Rounds | 3 |
+| Clients | 1 honest (`client-0`) + 1 malicious (`malicious`, label-flip) |
+| GPU | NVIDIA GeForce RTX 4050 Laptop GPU (6 GB VRAM, Ada Lovelace) |
+| GPU Optimisations | `torch.compile` (Inductor), AMP (`float16`), TF32 matmul, `pin_memory`, `persistent_workers` |
+| Environment | Docker Compose on Windows 11 / WSL2 / Docker Desktop / NVIDIA Container Toolkit |
+
+### Commands Used
+
+```powershell
+# Step 1: Clean slate
+docker compose down -v --remove-orphans
+
+# Step 2: Build (with gcc fix for torch.compile/Triton)
+docker compose build
+
+# Step 3: Pre-download CIFAR-10
+docker compose up data-init
+
+# Step 4: Run simulation (1 honest + 1 malicious)
+docker compose up --abort-on-container-exit server client-0 malicious
+
+# Monitor server logs in real-time (separate terminal):
+docker compose logs -f server
+
+# Check exit codes after run:
+docker inspect fl-server --format='{{.State.ExitCode}}'
+docker inspect fl-client-0 --format='{{.State.ExitCode}}'
+docker inspect fl-malicious --format='{{.State.ExitCode}}'
+```
+
+### Training Results
+
+| Round | Gate 1 (mTLS) | Gate 2 (Signing) | Gate 3 (Anomaly) | cos_sim | Eval Loss | Accuracy | Aggregated? |
+|-------|--------------|-----------------|-----------------|---------|-----------|----------|-------------|
+| 1 | 2/2 ✓ | 2/2 ✓ | Z-score fallback: 2 accepted | — | 1.8472 | 23.55% | ✅ Yes (2 updates) |
+| 2 | 2/2 ✓ | 2/2 ✓ | Delta cosine: 2 accepted | **+0.0166** | 1.6619 | 25.35% | ✅ Yes (2 updates) |
+| 3 | 2/2 ✓ | 2/2 ✓ | Delta cosine: **1 rejected** | **−0.1109** | 1.6619 | 25.33% | ❌ Skipped (`MIN_ACCEPTED=2`) |
+
+**Total runtime:** 42.88 s  
+**Aggregate failures:** 0 / 3 rounds (all clients completed every round)  
+**Gate 3 rejections:** 1 (client-1 in round 3)
+
+### Key Log Lines
+
+```
+# ── Gate 1: mTLS ──
+fl-server    | [SERVER] 🔒 Loading mTLS certificates from /certs
+fl-server    | [SERVER] ✓  CA / Server cert / Server key loaded
+fl-server    | Flower ECE: gRPC server running (3 rounds), SSL is enabled
+fl-client-0  | [Client 0] 🔒 Loading mTLS certificates from /certs
+fl-client-0  | [mTLS] ✓  gRPC patched – client certificate will be presented on connect
+fl-malicious | [MALICIOUS 1] 🔒 mTLS certs loaded  → Gate 1 WILL pass
+
+# ── Gate 2: Signature Verification (all rounds) ──
+fl-server    | [Gate 2] ✓  Signature VALID for client-0
+fl-server    | [Gate 2] ✓  Signature VALID for client-1
+fl-server    | [Gate 2] Result: 2 passed, 0 rejected
+fl-client-0  |   → fit loss: 1.5590  [signed ✓, round=1]
+fl-malicious |   [MALICIOUS] Update SIGNED  ✓  → Gate 2 passes, Gate 3 should FIRE
+
+# ── Gate 3: Anomaly Detection ──
+# Round 1 (no reference): Z-score fallback
+fl-server    | [Gate 3] Weight norms: {'1': '16.54', '0': '12.78'}
+fl-server    | [Gate 3] Mean norm: 14.66  |  Std: 1.88  |  Z-threshold: 2.0
+fl-server    | [Gate 3] ✓  client-1: z=1.00  ACCEPTED
+fl-server    | [Gate 3] ✓  client-0: z=1.00  ACCEPTED
+fl-server    | [Gate 3] Result: 2 accepted, 0 rejected
+
+# Round 2: delta cosine barely positive → not yet detectable
+fl-server    | [Gate 3] Delta norms: {'1': '10.591539', '0': '8.288578'}
+fl-server    | [Gate 3] cos_sim(client-1 Δ, client-0 Δ) = 0.0166
+fl-server    | [Gate 3] ✓  Correlated deltas – both clients accepted
+fl-server    | [Gate 3] Result: 2 accepted, 0 rejected
+
+# Round 3: anti-correlated → CAUGHT
+fl-server    | [Gate 3] Delta norms: {'1': '10.150310', '0': '7.188231'}
+fl-server    | [Gate 3] cos_sim(client-1 Δ, client-0 Δ) = -0.1109
+fl-server    | [Gate 3] 🚨 SECURITY ALERT: anti-correlated deltas (cos_sim=-0.1109 < 0)
+fl-server    | [Gate 3] 🚨 SECURITY ALERT: client-1 REJECTED (largest delta norm 10.150310)
+fl-server    | [Gate 3] Result: 1 accepted, 1 rejected ['1']
+fl-server    | [Zero-Trust] Only 1 update(s) survived the pipeline (minimum required: 2) – skipping aggregation
+
+# ── Clean exit ──
+fl-server    | Run finished 3 round(s) in 42.88s
+fl-server exited with code 0
+fl-client-0 exited with code 0
+fl-malicious exited with code 0
+```
+
+### Observations
+
+1. **All 3 Zero-Trust gates work end-to-end.**
+   - Gate 1 (mTLS): `SSL is enabled`, all clients authenticated.
+   - Gate 2 (RSA-PSS signing): 6/6 signatures verified (`[signed ✓, round=N]` with replay protection).
+   - Gate 3 (cosine anomaly): detected anti-correlated deltas (`cos_sim = −0.1109`) in round 3.
+
+2. **`MIN_ACCEPTED` guard works.** After Gate 3 rejected client-1 in round 3, only 1 update survived. The server correctly skipped aggregation rather than letting a single client dominate the global model.
+
+3. **`torch.compile` works after Dockerfile fix.** Adding `gcc` to the image resolved the Triton JIT compilation error. First-round training took longer (~15 s) due to Inductor graph compilation; subsequent rounds were faster. This is expected `torch.compile` warm-up behaviour.
+
+4. **Accuracy is low (23–25%) because the attacker poisons rounds 1–2.** The label-flip attack drags the model in the wrong direction. In round 3, the attack is detected but aggregation is skipped (`MIN_ACCEPTED=2`), so accuracy stays flat. Compare with the clean baseline (Phase 1: ~70%) to see the attack's impact.
+
+5. **cos_sim trend confirms detection ramp-up.** Round 2: `+0.017` (barely positive, near-zero — attack signal is weak early). Round 3: `−0.111` (negative — attack signal is now clear). Detection strengthens over rounds as the honest client's gradient direction stabilises.
+
+6. **GPU confirmed working.** Both `client-0` and `malicious` report `Using device: cuda` — PyTorch sees the GPU inside the container.
+
+7. **All containers exit cleanly** with code `0`.
+
+### Troubleshooting Reference
+
+#### Containers exit immediately
+
+```powershell
+# Check exit code
+docker inspect <container-name> --format='{{.State.ExitCode}}'
+
+# Check logs
+docker compose logs <service-name>
+
+# Common codes:
+#   0 = clean exit               137 = OOM killed (SIGKILL)
+#   1 = Python exception          139 = segfault
+```
+
+#### SSL / mTLS errors
+
+```powershell
+# Verify certs exist and are readable
+docker compose run --rm server ls -la /certs/
+
+# Re-generate if expired or corrupted
+bash generate_certs.sh
+
+# Check cert validity
+openssl x509 -in certs/server.crt -noout -dates -subject
+openssl verify -CAfile certs/ca.crt certs/client-0.crt
+```
+
+#### GPU Out of Memory (OOM)
+
+If training crashes with `CUDA out of memory`, reduce batch size or disable `torch.compile` in `client.py`:
+
+```python
+# Option 1: Reduce batch size (in client.py and client_malicious.py)
+BATCH_SIZE = 32  # default is 64; halving cuts VRAM usage ~50%
+
+# Option 2: Disable torch.compile (removes Triton graph overhead)
+# In client.py CifarClient.__init__(), comment out:
+# self.model = torch.compile(self.model)
+
+# Option 3: Limit GPU memory per container in docker-compose.yml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+    limits:
+      memory: 4G  # cap container memory
+```
+
+### How to Reproduce
+
+```powershell
+# Full run (attack scenario):
+docker compose down -v --remove-orphans
+docker compose build
+docker compose up data-init
+docker compose up --abort-on-container-exit server client-0 malicious
+
+# Clean baseline (2 honest clients):
+docker compose --profile clean up --abort-on-container-exit server client-0 client-1
+
+# Follow server logs live (separate terminal):
+docker compose logs -f server
+```
+
+---
+
+## Phase 8 – *(pending)*
 
 **Date:**  
 **Status:**  
@@ -455,7 +944,3 @@ docker compose --profile clean up --abort-on-container-exit server client-0 clie
 ### Observations
 
 ### How to Reproduce
-
----
-
-*Add a new `## Phase N` section above for each subsequent phase.*

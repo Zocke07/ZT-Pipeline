@@ -43,15 +43,21 @@ NUM_CLIENTS = int(os.environ.get("NUM_CLIENTS", "2"))
 ANOMALY_Z_THRESHOLD = float(os.environ.get("ANOMALY_Z_THRESHOLD", "2.0"))
 
 
-def _load_certificates() -> Optional[Tuple[bytes, bytes, bytes]]:
-    """Load mTLS certificates for the Flower gRPC server."""
+def _load_certificates() -> Tuple[bytes, bytes, bytes]:
+    """Load mTLS certificates for the Flower gRPC server.
+
+    Zero-Trust: the server MUST NOT start without valid certificates.
+    """
     ca_cert_path = CERT_DIR / "ca.crt"
     server_cert_path = CERT_DIR / "server.crt"
     server_key_path = CERT_DIR / "server.key"
 
-    if not all(p.exists() for p in [ca_cert_path, server_cert_path, server_key_path]):
-        print("[SERVER] ⚠  Certificates not found – running WITHOUT mTLS (insecure)")
-        return None
+    missing = [p for p in [ca_cert_path, server_cert_path, server_key_path] if not p.exists()]
+    if missing:
+        raise RuntimeError(
+            f"[SERVER] \u2717  FATAL: mTLS certificates missing: {missing}. "
+            f"Zero-Trust policy: server MUST NOT start without mTLS."
+        )
 
     print(f"[SERVER] 🔒 Loading mTLS certificates from {CERT_DIR}")
     ca_cert = ca_cert_path.read_bytes()
@@ -233,11 +239,13 @@ class ZeroTrustFedAvg(FedAvg):
         self,
         public_keys: dict,
         z_threshold: float = 2.0,
+        min_accepted: int = 1,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.public_keys = public_keys
         self.z_threshold = z_threshold
+        self.min_accepted = min_accepted
         # Tracks the most-recent aggregated global model for delta computation
         self._global_params: Optional[List[np.ndarray]] = None
 
@@ -275,7 +283,7 @@ class ZeroTrustFedAvg(FedAvg):
                 continue
 
             ndarrays = parameters_to_ndarrays(fit_res.parameters)
-            if verify_signature(ndarrays, sig, self.public_keys[cid]):
+            if verify_signature(ndarrays, sig, self.public_keys[cid], server_round=server_round):
                 print(f"[Gate 2] ✓  Signature VALID for client-{cid}")
                 verified.append((cid, ndarrays, client_proxy, fit_res))
             else:
@@ -305,7 +313,17 @@ class ZeroTrustFedAvg(FedAvg):
         if not accepted:
             log(WARNING, "[Gate 3] All updates anomalous – skipping aggregation")
             return None, {}
-
+        # \u2500\u2500 Minimum accepted clients guard (T3) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        if len(accepted) < self.min_accepted:
+            log(
+                WARNING,
+                "[Zero-Trust] Only %d update(s) survived the pipeline "
+                "(minimum required: %d) \u2013 skipping aggregation to prevent "
+                "single-client model domination.",
+                len(accepted),
+                self.min_accepted,
+            )
+            return None, {}
         # ── FedAvg on clean updates ────────────────────────────────
         print(f"\n── Aggregating {len(accepted)} clean updates via FedAvg ──")
         agg_result = super().aggregate_fit(server_round, accepted, failures)
@@ -327,15 +345,18 @@ def main() -> None:
     print(f"[Gate 3] Anomaly Z-score threshold: {ANOMALY_Z_THRESHOLD}")
 
     MIN_CLIENTS = int(os.environ.get("MIN_CLIENTS", str(NUM_CLIENTS)))
+    MIN_ACCEPTED = int(os.environ.get("MIN_ACCEPTED", "2"))
 
     strategy = ZeroTrustFedAvg(
         public_keys=public_keys,
         z_threshold=ANOMALY_Z_THRESHOLD,
+        min_accepted=MIN_ACCEPTED,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=MIN_CLIENTS,
         min_evaluate_clients=MIN_CLIENTS,
         min_available_clients=MIN_CLIENTS,
+        on_fit_config_fn=lambda server_round: {"server_round": server_round},
     )
 
     # Gate 1: Load mTLS certificates

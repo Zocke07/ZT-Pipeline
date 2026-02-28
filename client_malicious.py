@@ -66,6 +66,12 @@ BATCH_SIZE    = 64
 LEARNING_RATE = 0.001
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# GPU optimisation: enable TF32 on Ampere+ GPUs (RTX 4000 Ada)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
 ATTACK_MODE   = os.environ.get("ATTACK_MODE",   "label_flip")
 NOISE_SCALE   = float(os.environ.get("NOISE_SCALE", "5.0"))
 SOURCE_LABEL  = int(os.environ.get("SOURCE_LABEL", "0"))
@@ -222,7 +228,7 @@ class MaliciousClient(fl.client.NumPyClient):
 
     def set_parameters(self, parameters: List) -> None:
         state_dict = OrderedDict(
-            {k: torch.tensor(v)
+            {k: torch.from_numpy(np.array(v))
              for k, v in zip(self.model.state_dict().keys(), parameters)}
         )
         self.model.load_state_dict(state_dict, strict=True)
@@ -252,9 +258,10 @@ class MaliciousClient(fl.client.NumPyClient):
                   f"→ added noise (σ={NOISE_SCALE})")
 
         # Gate 2: Sign the poisoned weights (signature will be VALID)
+        server_round = int(config.get("server_round", 0))
         metrics: dict = {"client_id": float(self.client_id)}
         if self.signing_key is not None:
-            sig = sign_parameters(poisoned_params, self.signing_key)
+            sig = sign_parameters(poisoned_params, self.signing_key, server_round=server_round)
             metrics["signature"] = sig
             print(f"  [MALICIOUS] Update SIGNED  ✓  → Gate 2 passes, Gate 3 should FIRE")
 

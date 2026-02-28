@@ -1,0 +1,123 @@
+# ──────────────────────────────────────────────────────────────
+#  BASELINE (Insecure) Federated Learning – Docker Compose
+#
+#  This is the CONTROL GROUP for the thesis experiment.
+#  It runs the exact same FL pipeline (FedAvg, CIFAR-10, CifarCNN)
+#  but with ALL Zero-Trust mechanisms stripped out:
+#
+#    ✗  No mTLS certificates        (plain gRPC)
+#    ✗  No signing keys             (unsigned updates)
+#    ✗  No anomaly detection        (all updates accepted)
+#    ✗  No certificate volumes      (nothing to mount)
+#
+#  Usage:
+#    cd baseline_experiment/
+#    docker compose -f docker-compose-baseline.yml up --abort-on-container-exit
+#
+#  The build context is the PARENT directory (..) so that the
+#  shared model.py and requirements.txt are accessible.
+#
+#  GPU: Every container gets access to all GPUs (same as ZT-Pipeline).
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ── Data initialiser ─────────────────────────────────────
+  data-init:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-data-init
+    command: >
+      python -c "from torchvision import datasets, transforms;
+      datasets.CIFAR10('/data', train=True,  download=True,
+        transform=transforms.ToTensor());
+      datasets.CIFAR10('/data', train=False, download=True,
+        transform=transforms.ToTensor());
+      print('CIFAR-10 ready.')"
+    volumes:
+      - cifar-data:/data
+    restart: "no"
+
+  # ── Flower Server (INSECURE) ─────────────────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-server
+    command: python baseline_server.py
+    ports:
+      - "8081:8080"
+    environment:
+      - NUM_CLIENTS=2
+      - MIN_CLIENTS=2
+      - NUM_ROUNDS=3
+    # ── NO certificate volumes ──
+    # ── NO signing key volumes  ──
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Client 0 (Honest, Insecure) ─────────────────────────
+  client-0:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-client-0
+    command: >
+      sh -c "sleep 5 && python baseline_client.py"
+    environment:
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+    volumes:
+      - cifar-data:/data
+    # ── NO certificate volumes ──
+    # ── NO signing key volumes  ──
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Client 1 (Honest, Insecure) ─────────────────────────
+  client-1:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-client-1
+    command: >
+      sh -c "sleep 5 && python baseline_client.py"
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+    volumes:
+      - cifar-data:/data
+    # ── NO certificate volumes ──
+    # ── NO signing key volumes  ──
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  cifar-data:

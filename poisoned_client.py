@@ -46,6 +46,12 @@ BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# GPU optimisation: enable TF32 on Ampere+ GPUs (RTX 4000 Ada)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
 POISON_MODE = os.environ.get("POISON_MODE", "noise")    # "noise" or "scale"
 POISON_SCALE = float(os.environ.get("POISON_SCALE", "100.0"))
 
@@ -135,7 +141,7 @@ class PoisonedClient(fl.client.NumPyClient):
 
     def set_parameters(self, parameters: List) -> None:
         state_dict = OrderedDict(
-            {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)}
+            {k: torch.from_numpy(np.array(v)) for k, v in zip(self.model.state_dict().keys(), parameters)}
         )
         self.model.load_state_dict(state_dict, strict=True)
 
@@ -156,9 +162,10 @@ class PoisonedClient(fl.client.NumPyClient):
             print(f"  → [POISON] Injected random noise (σ={POISON_SCALE})")
 
         # Sign the poisoned weights (Gate 2 will pass!)
+        server_round = int(config.get("server_round", 0))
         metrics: dict = {"client_id": float(self.client_id)}
         if self.signing_key is not None:
-            sig = sign_parameters(poisoned, self.signing_key)
+            sig = sign_parameters(poisoned, self.signing_key, server_round=server_round)
             metrics["signature"] = sig
             print(f"  → [POISON] Poisoned update SIGNED ✓ (will pass Gate 2)")
 

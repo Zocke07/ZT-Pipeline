@@ -1,6 +1,11 @@
 # ──────────────────────────────────────────────────────────────
-#  Base image: NVIDIA CUDA 12.4 + cuDNN 9 on Ubuntu 22.04
-#  Provides GPU acceleration for PyTorch inside Docker.
+#  Baseline (Insecure) FL – Dockerfile
+#
+#  Identical runtime to the ZT-Pipeline image (same CUDA base,
+#  same Python packages, same model) so that any performance
+#  difference is attributable ONLY to the security mechanisms.
+#
+#  Key difference: no signing.py copied, no cert infrastructure.
 # ──────────────────────────────────────────────────────────────
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
@@ -15,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python packages (PyTorch w/ CUDA 12.4, Flower, torchvision)
+# Install Python packages (same versions as ZT-Pipeline for fair comparison)
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
@@ -23,8 +28,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
         --index-url https://download.pytorch.org/whl/cu124 && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY model.py server.py client.py signing.py poisoned_client.py client_malicious.py ./
+# Copy ONLY the baseline scripts + shared model (no signing.py, no certs)
+COPY model.py ./
+COPY baseline_experiment/baseline_server.py ./
+COPY baseline_experiment/baseline_client.py ./
+COPY baseline_experiment/baseline_malicious_client.py ./
 
-# Default: print usage
 CMD ["python", "--version"]

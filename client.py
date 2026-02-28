@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import grpc
+import numpy as np
 import flwr as fl
 import torch
 import torch.nn as nn
@@ -44,6 +45,12 @@ BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 LOCAL_EPOCHS = 1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# GPU optimisation: enable TF32 on Ampere+ GPUs (RTX 4000 Ada)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 
 # ---------------------------------------------------------------------------
@@ -74,18 +81,20 @@ def partition_data(train_set, num_clients: int, client_id: int):
 # ---------------------------------------------------------------------------
 # Train / evaluate helpers
 # ---------------------------------------------------------------------------
-def train_one_epoch(model: nn.Module, loader: DataLoader) -> float:
-    """Train for one epoch, return average loss."""
+def train_one_epoch(model: nn.Module, loader: DataLoader, scaler: torch.amp.GradScaler) -> float:
+    """Train for one epoch with AMP mixed precision, return average loss."""
     model.train()
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     running_loss = 0.0
     for images, labels in loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(images), labels)
-        loss.backward()
-        optimizer.step()
+        images, labels = images.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
+            loss = criterion(model(images), labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
 
@@ -95,9 +104,9 @@ def evaluate(model: nn.Module, loader: DataLoader) -> Tuple[float, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
     total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
         for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            images, labels = images.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             outputs = model(images)
             total_loss += criterion(outputs, labels).item() * images.size(0)
             correct += (outputs.argmax(dim=1) == labels).sum().item()
@@ -119,23 +128,35 @@ class CifarClient(fl.client.NumPyClient):
     def __init__(self, client_id: int, num_clients: int) -> None:
         self.client_id = client_id
         self.model = CifarCNN().to(DEVICE)
+        # G4: torch.compile for PyTorch 2.x graph optimization
+        if DEVICE.type == "cuda":
+            self.model = torch.compile(self.model)
+
+        # G2: AMP GradScaler for mixed-precision training
+        self.scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+
+        use_pin = DEVICE.type == "cuda"
         train_set, test_set = _get_cifar10()
         self.train_loader = DataLoader(
             partition_data(train_set, num_clients, client_id),
             batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
+            pin_memory=use_pin, persistent_workers=True,
         )
         self.test_loader = DataLoader(
             test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
+            pin_memory=use_pin, persistent_workers=True,
         )
 
-        # Gate 2: Load signing private key
+        # Gate 2: Load signing private key — MANDATORY (Zero Trust: deny by default)
         key_path = SIGNING_KEY_DIR / f"client-{client_id}.private.pem"
         if key_path.exists():
             self.signing_key = load_private_key(key_path)
             print(f"[Client {client_id}] ✓  Signing key loaded from {key_path}")
         else:
-            self.signing_key = None
-            print(f"[Client {client_id}] ⚠  No signing key – updates will be UNSIGNED")
+            raise RuntimeError(
+                f"[Client {client_id}] ✗  FATAL: signing key not found at {key_path}. "
+                f"Zero-Trust policy: unsigned clients MUST NOT participate."
+            )
 
         print(f"[Client {client_id}] Using device: {DEVICE}  |  "
               f"Train samples: {len(self.train_loader.dataset)}")
@@ -146,23 +167,21 @@ class CifarClient(fl.client.NumPyClient):
 
     def set_parameters(self, parameters: List) -> None:
         state_dict = OrderedDict(
-            {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)}
+            {k: torch.from_numpy(np.array(v)) for k, v in zip(self.model.state_dict().keys(), parameters)}
         )
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        loss = train_one_epoch(self.model, self.train_loader)
+        loss = train_one_epoch(self.model, self.train_loader, self.scaler)
         updated_params = self.get_parameters(config={})
 
-        # Gate 2: Sign the model update
+        # Gate 2: Sign the model update (mandatory — no fallback)
+        server_round = int(config.get("server_round", 0))
         metrics: dict = {"client_id": float(self.client_id)}
-        if self.signing_key is not None:
-            sig = sign_parameters(updated_params, self.signing_key)
-            metrics["signature"] = sig
-            print(f"  → fit loss: {loss:.4f}  [signed ✓]")
-        else:
-            print(f"  → fit loss: {loss:.4f}  [UNSIGNED ⚠]")
+        sig = sign_parameters(updated_params, self.signing_key, server_round=server_round)
+        metrics["signature"] = sig
+        print(f"  → fit loss: {loss:.4f}  [signed ✓, round={server_round}]")
 
         return updated_params, len(self.train_loader.dataset), metrics
 
@@ -239,14 +258,16 @@ def main() -> None:
     num_clients = int(os.environ.get("NUM_CLIENTS", "2"))
     server_addr = os.environ.get("SERVER_ADDRESS", "server:8080")
 
-    # Gate 1: Load mTLS certificates for this client
+    # Gate 1: Load mTLS certificates — MANDATORY (Zero Trust: deny by default)
     certs = _load_client_certificates(client_id)
-    if certs is not None:
-        ca_cert, client_cert, client_key = certs
-        _patch_grpc_for_mtls(ca_cert, client_cert, client_key)
-        root_certificates = ca_cert          # Flower passes this to gRPC
-    else:
-        root_certificates = None             # Insecure fallback
+    if certs is None:
+        raise RuntimeError(
+            f"[Client {client_id}] \u2717  FATAL: mTLS certificates missing. "
+            f"Zero-Trust policy: unauthenticated clients MUST NOT connect."
+        )
+    ca_cert, client_cert, client_key = certs
+    _patch_grpc_for_mtls(ca_cert, client_cert, client_key)
+    root_certificates = ca_cert
 
     client = CifarClient(client_id, num_clients)
     fl.client.start_client(

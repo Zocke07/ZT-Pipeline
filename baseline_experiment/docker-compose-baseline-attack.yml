@@ -1,0 +1,118 @@
+# ──────────────────────────────────────────────────────────────
+#  BASELINE UNDER ATTACK – Experiment A
+#
+#  Insecure FL with 1 honest client + 1 label-flip attacker.
+#  The server runs vanilla FedAvg with NO security gates.
+#  The attacker's poisoned updates are blindly aggregated.
+#
+#  Expected result: global model accuracy degrades significantly.
+#
+#  Usage (standalone):
+#    docker compose -f baseline_experiment/docker-compose-baseline-attack.yml \
+#        up --abort-on-container-exit
+#
+#  Build context is the PARENT directory (..) so shared files
+#  (model.py, requirements.txt) are accessible.
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ── Data initialiser ─────────────────────────────────────
+  data-init:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-atk-data-init
+    command: >
+      python -c "from torchvision import datasets, transforms;
+      datasets.CIFAR10('/data', train=True,  download=True,
+        transform=transforms.ToTensor());
+      datasets.CIFAR10('/data', train=False, download=True,
+        transform=transforms.ToTensor());
+      print('CIFAR-10 ready.')"
+    volumes:
+      - cifar-data:/data
+    restart: "no"
+
+  # ── Flower Server (INSECURE – no gates) ──────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-atk-server
+    command: python baseline_server.py
+    ports:
+      - "8081:8080"
+    environment:
+      - NUM_CLIENTS=2
+      - MIN_CLIENTS=2
+      - NUM_ROUNDS=3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Client 0 (Honest, Insecure) ─────────────────────────
+  client-0:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-atk-client-0
+    command: >
+      sh -c "sleep 5 && python baseline_client.py"
+    environment:
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+    volumes:
+      - cifar-data:/data
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Malicious Client (Label Flip, Insecure) ─────────────
+  #  Same attack as the ZT malicious client:
+  #    - Global label flip (class i → class 9−i)
+  #    - 2 local epochs per round
+  #  But here: NO signing, NO mTLS → blindly accepted by server.
+  malicious:
+    build:
+      context: ..
+      dockerfile: baseline_experiment/Dockerfile
+    container_name: baseline-atk-malicious
+    command: >
+      sh -c "sleep 12 && python baseline_malicious_client.py"
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - ATTACK_MODE=label_flip
+      - LOCAL_EPOCHS=2
+    volumes:
+      - cifar-data:/data
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  cifar-data:

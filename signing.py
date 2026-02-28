@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
 
@@ -89,16 +90,25 @@ def load_private_key(pem_path: Path):
     return serialization.load_pem_private_key(pem_path.read_bytes(), password=None)
 
 
-def sign_parameters(parameters: List[np.ndarray], private_key) -> str:
+def sign_parameters(
+    parameters: List[np.ndarray],
+    private_key,
+    *,
+    server_round: int = 0,
+) -> str:
     """Sign serialized parameters and return a base64-encoded signature.
 
     Steps:
         1. Serialize the weight arrays to bytes.
-        2. Pre-hash with SHA-256 (keeps memory bounded for large models).
-        3. Sign the digest with RSA-PSS + SHA-256.
-        4. Return base64-encoded signature (safe for Flower metrics dict).
+        2. Prepend the round number as a 4-byte big-endian integer
+           (replay-protection nonce).
+        3. Pre-hash with SHA-256 (keeps memory bounded for large models).
+        4. Sign the digest with RSA-PSS + SHA-256.
+        5. Return base64-encoded signature (safe for Flower metrics dict).
     """
     data = serialize_parameters(parameters)
+    # Replay protection: bind signature to the specific round
+    data = server_round.to_bytes(4, "big") + data
     digest = _digest(data)
     signature = private_key.sign(
         digest,
@@ -124,12 +134,19 @@ def verify_signature(
     parameters: List[np.ndarray],
     signature_b64: str,
     public_key,
+    *,
+    server_round: int = 0,
 ) -> bool:
     """Verify an RSA-PSS signature over the serialized parameters.
 
+    The round number is prepended to the payload before hashing so that
+    signatures are bound to a specific round (replay protection).
+
     Returns ``True`` if the signature is valid, ``False`` otherwise.
+    Raises on unexpected errors (only ``InvalidSignature`` is caught).
     """
     data = serialize_parameters(parameters)
+    data = server_round.to_bytes(4, "big") + data
     digest = _digest(data)
     signature = base64.b64decode(signature_b64)
     try:
@@ -143,7 +160,7 @@ def verify_signature(
             utils.Prehashed(hashes.SHA256()),
         )
         return True
-    except Exception:
+    except InvalidSignature:
         return False
 
 
