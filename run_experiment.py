@@ -251,7 +251,6 @@ def run_experiment_a(timeout: int) -> Dict[str, Any]:
     t_start = time.perf_counter()
     rc, stdout, stderr = compose_up(compose_files, project, timeout)
     wall_time = time.perf_counter() - t_start
-    combined_output = stdout + stderr
 
     result["exit_code"] = rc
     result["wall_time_seconds"] = round(wall_time, 1)
@@ -358,7 +357,6 @@ def run_experiment_b(timeout: int) -> Dict[str, Any]:
     t_start = time.perf_counter()
     rc, stdout, stderr = compose_up(compose_files, project, timeout)
     wall_time = time.perf_counter() - t_start
-    combined_output = stdout + stderr
 
     result["exit_code"] = rc
     result["wall_time_seconds"] = round(wall_time, 1)

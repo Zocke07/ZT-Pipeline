@@ -28,8 +28,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
         --index-url https://download.pytorch.org/whl/cu124 && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy ONLY the baseline scripts + shared model (no signing.py, no certs)
-COPY model.py ./
+# Copy shared modules + baseline scripts (no signing.py, no certs)
+COPY model.py data_utils.py training.py ./
 COPY baseline_experiment/baseline_server.py ./
 COPY baseline_experiment/baseline_client.py ./
 COPY baseline_experiment/baseline_malicious_client.py ./

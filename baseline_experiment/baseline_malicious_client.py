@@ -18,96 +18,38 @@ Attack mode: Global label flip  (label → 9 − label).
 
 import os
 import warnings
-from collections import OrderedDict
-from typing import List, Tuple
+from typing import List
 
-import numpy as np
 import flwr as fl
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-from model import CifarCNN
+from data_utils import get_cifar10, partition_data
+from training import (
+    BATCH_SIZE,
+    DEVICE,
+    create_model,
+    evaluate,
+    get_parameters,
+    set_parameters,
+    train_one_epoch_with_label_transform,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ---------------------------------------------------------------------------
 # Configuration (mirrors client_malicious.py for fair comparison)
 # ---------------------------------------------------------------------------
-BATCH_SIZE = 64
-LEARNING_RATE = 0.001
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
 ATTACK_MODE = os.environ.get("ATTACK_MODE", "label_flip")
 NUM_CLASSES = 10
 LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "2"))
 
 
 # ---------------------------------------------------------------------------
-# Data helpers (identical to baseline_client.py)
-# ---------------------------------------------------------------------------
-def _get_cifar10(data_dir: str = "/data"):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2470, 0.2435, 0.2616)),
-    ])
-    train_set = datasets.CIFAR10(data_dir, train=True,  download=True, transform=transform)
-    test_set  = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform)
-    return train_set, test_set
-
-
-def partition_data(train_set, num_clients: int, client_id: int):
-    total = len(train_set)
-    shard_size = total // num_clients
-    start = client_id * shard_size
-    return Subset(train_set, list(range(start, start + shard_size)))
-
-
-# ---------------------------------------------------------------------------
 # Attack: Label Flipping
 # ---------------------------------------------------------------------------
-def _flip_labels(labels: torch.Tensor) -> torch.Tensor:
+def _flip_labels(labels):
     """Invert every label: class i -> class (NUM_CLASSES - 1 - i)."""
     return (NUM_CLASSES - 1) - labels
-
-
-def train_with_label_flipping(model: nn.Module, loader: DataLoader) -> float:
-    """Train one epoch on FLIPPED labels. Returns average loss."""
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    running_loss = 0.0
-    for images, labels in loader:
-        images = images.to(DEVICE)
-        labels = _flip_labels(labels).to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(images), labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * images.size(0)
-    return running_loss / len(loader.dataset)
-
-
-def evaluate(model: nn.Module, loader: DataLoader) -> Tuple[float, float]:
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            total_loss += criterion(outputs, labels).item() * images.size(0)
-            correct += (outputs.argmax(dim=1) == labels).sum().item()
-            total += labels.size(0)
-    return total_loss / total, correct / total
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +66,9 @@ class BaselineMaliciousClient(fl.client.NumPyClient):
 
     def __init__(self, client_id: int, num_clients: int) -> None:
         self.client_id = client_id
-        self.model = CifarCNN().to(DEVICE)
+        self.model = create_model(compile_model=False)
 
-        train_set, test_set = _get_cifar10()
+        train_set, test_set = get_cifar10()
         self.train_loader = DataLoader(
             partition_data(train_set, num_clients, client_id),
             batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
@@ -142,20 +84,18 @@ class BaselineMaliciousClient(fl.client.NumPyClient):
               f"Train samples: {len(self.train_loader.dataset)}")
 
     def get_parameters(self, config) -> List:
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        return get_parameters(self.model)
 
     def set_parameters(self, parameters: List) -> None:
-        state_dict = OrderedDict(
-            {k: torch.from_numpy(np.array(v))
-             for k, v in zip(self.model.state_dict().keys(), parameters)}
-        )
-        self.model.load_state_dict(state_dict, strict=True)
+        set_parameters(self.model, parameters)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
 
         for _ in range(LOCAL_EPOCHS):
-            loss = train_with_label_flipping(self.model, self.train_loader)
+            loss = train_one_epoch_with_label_transform(
+                self.model, self.train_loader, _flip_labels,
+            )
         poisoned_params = self.get_parameters(config={})
 
         print(f"  [BASELINE MALICIOUS] fit loss (flipped labels): {loss:.4f}  "

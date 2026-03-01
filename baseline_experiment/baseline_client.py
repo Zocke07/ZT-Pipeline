@@ -21,100 +21,24 @@ is the presence or absence of Zero-Trust security mechanisms.
 
 import os
 import warnings
-from collections import OrderedDict
-from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
-import numpy as np
 import flwr as fl
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-# model.py is copied into /app at build time (same CifarCNN as the ZT pipeline)
-from model import CifarCNN
+from data_utils import get_cifar10, partition_data
+from training import (
+    BATCH_SIZE,
+    DEVICE,
+    create_model,
+    create_scaler,
+    evaluate,
+    get_parameters,
+    set_parameters,
+    train_one_epoch,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (identical to the ZT client for fair comparison)
-# ---------------------------------------------------------------------------
-BATCH_SIZE = 64
-LEARNING_RATE = 0.001
-LOCAL_EPOCHS = 1
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# GPU optimisation: enable TF32 on Ampere+ GPUs
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-
-# ---------------------------------------------------------------------------
-# Data helpers (identical to client.py)
-# ---------------------------------------------------------------------------
-def _get_cifar10(data_dir: str = "/data"):
-    """Download CIFAR-10 and return (train_set, test_set)."""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2470, 0.2435, 0.2616)),
-    ])
-    train_set = datasets.CIFAR10(data_dir, train=True,  download=True, transform=transform)
-    test_set  = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform)
-    return train_set, test_set
-
-
-def partition_data(train_set, num_clients: int, client_id: int):
-    """Simple IID partition: split training set into equal shards."""
-    total = len(train_set)
-    shard_size = total // num_clients
-    start = client_id * shard_size
-    end = start + shard_size
-    return Subset(train_set, list(range(start, end)))
-
-
-# ---------------------------------------------------------------------------
-# Train / evaluate helpers (identical to client.py)
-# ---------------------------------------------------------------------------
-def train_one_epoch(
-    model: nn.Module, loader: DataLoader, scaler: torch.amp.GradScaler,
-) -> float:
-    """Train for one epoch with AMP mixed precision, return average loss."""
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    running_loss = 0.0
-    for images, labels in loader:
-        images = images.to(DEVICE, non_blocking=True)
-        labels = labels.to(DEVICE, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
-            loss = criterion(model(images), labels)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        running_loss += loss.item() * images.size(0)
-    return running_loss / len(loader.dataset)
-
-
-def evaluate(model: nn.Module, loader: DataLoader) -> Tuple[float, float]:
-    """Evaluate model, return (loss, accuracy)."""
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
-        for images, labels in loader:
-            images = images.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
-            outputs = model(images)
-            total_loss += criterion(outputs, labels).item() * images.size(0)
-            correct += (outputs.argmax(dim=1) == labels).sum().item()
-            total += labels.size(0)
-    return total_loss / total, correct / total
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +54,11 @@ class BaselineCifarClient(fl.client.NumPyClient):
 
     def __init__(self, client_id: int, num_clients: int) -> None:
         self.client_id = client_id
-        self.model = CifarCNN().to(DEVICE)
-        if DEVICE.type == "cuda":
-            self.model = torch.compile(self.model)
-
-        self.scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+        self.model = create_model(compile_model=True)
+        self.scaler = create_scaler()
 
         use_pin = DEVICE.type == "cuda"
-        train_set, test_set = _get_cifar10()
+        train_set, test_set = get_cifar10()
         self.train_loader = DataLoader(
             partition_data(train_set, num_clients, client_id),
             batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
@@ -153,14 +74,10 @@ class BaselineCifarClient(fl.client.NumPyClient):
 
     # -- Flower interface ---------------------------------------------------
     def get_parameters(self, config) -> List:
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        return get_parameters(self.model)
 
     def set_parameters(self, parameters: List) -> None:
-        state_dict = OrderedDict(
-            {k: torch.from_numpy(np.array(v))
-             for k, v in zip(self.model.state_dict().keys(), parameters)}
-        )
-        self.model.load_state_dict(state_dict, strict=True)
+        set_parameters(self.model, parameters)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -193,7 +110,6 @@ def main() -> None:
     client = BaselineCifarClient(client_id, num_clients)
 
     # insecure=True  → plain gRPC, no TLS at all
-    # No root_certificates → no certificate verification
     fl.client.start_client(
         server_address=server_addr,
         client=client.to_client(),

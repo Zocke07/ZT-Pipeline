@@ -15,7 +15,7 @@ set -euo pipefail
 
 KEY_DIR="signing_keys"
 KEY_SIZE=2048
-NUM_CLIENTS="${1:-3}"
+NUM_CLIENTS="${1:-2}"
 
 echo "==> Creating signing key directory: ${KEY_DIR}/"
 rm -rf "${KEY_DIR}"

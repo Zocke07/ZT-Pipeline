@@ -41,7 +41,7 @@
     - 10.5  [`client.py` — The Honest Participant](#105-clientpy--the-honest-participant)
     - 10.6  [`server.py` — The Zero-Trust Aggregator](#106-serverpy--the-zero-trust-aggregator)
     - 10.7  [`client_malicious.py` — The Adversarial Proof](#107-client_maliciouspy--the-adversarial-proof)
-    - 10.8  [`poisoned_client.py` — The Brute-Force Attacker](#108-poisoned_clientpy--the-brute-force-attacker)
+    - 10.8  [Shared Modules — `data_utils.py`, `training.py`, `mtls.py`](#108-shared-modules--data_utilspy-trainingpy-mtlspy)
     - 10.9  [`Dockerfile` — Reproducible Environment](#109-dockerfile--reproducible-environment)
     - 10.10 [`docker-compose.yml` — Orchestration and Isolation](#1010-docker-composeyml--orchestration-and-isolation)
 11. [Infrastructure & Deployment](#11-infrastructure--deployment)
@@ -87,8 +87,7 @@ Imagine the global model is a **classified battle plan** being collaboratively r
 |---|---|---|
 | **Central Command HQ** | `server.py` (`ZeroTrustFedAvg`) | Collects field reports, verifies them, and merges them into the next version of the battle plan. Never trusts a report just because the sender *looks* legitimate. |
 | **Field Officer** | `client.py` (`CifarClient`) | Trains locally on their subset of intelligence data, then submits an update *signed with their personal wax seal*. |
-| **Double Agent** | `client_malicious.py` (`MaliciousClient`) | Holds a valid badge *and* a valid seal (passes Gates 1 & 2) but deliberately submits a report that would mislead the army (label-flip attack). |
-| **Saboteur** | `poisoned_client.py` (`PoisonedClient`) | Passes identity checks but submits pure static noise instead of real intelligence. |
+| **Double Agent / Saboteur** | `client_malicious.py` (`MaliciousClient`) | Holds a valid badge *and* a valid seal (passes Gates 1 & 2) but deliberately submits a misleading report. Supports four attack modes: `label_flip`, `targeted`, `noise`, and `scale`. |
 | **Military ID Badge** (Gate 1) | mTLS Certificate (`certs/client-*.crt`) | The officer's CA-signed X.509 certificate. Central Command checks this *before opening the door*. |
 | **Personal Wax Seal** (Gate 2) | RSA-PSS Digital Signature (`signing.py`) | Each report is sealed with the officer's private stamp. HQ verifies the seal against the registered public imprint before reading the report. |
 | **Behavioral Screening** (Gate 3) | Anomaly Detection (cosine similarity / Z-score in `server.py`) | Even if an officer has the right badge and seal, HQ compares the *content* of their report against all other reports. If one report tells the troops to march *backwards* while everyone else says *forward*, that officer is flagged and their report is discarded. |
@@ -380,9 +379,12 @@ ZT-Pipeline/
 ├── model.py                  # CifarCNN – shared model definition
 ├── server.py                 # Flower server + ZeroTrustFedAvg strategy
 ├── client.py                 # Honest Flower client (train + sign + send)
-├── client_malicious.py       # Label-flip / targeted / noise attacker
-├── poisoned_client.py        # Random-noise / scale poisoning client
+├── client_malicious.py       # Adversarial client (label_flip / targeted / noise / scale)
 ├── signing.py                # RSA-PSS sign/verify utilities (replay-protected)
+│
+├── data_utils.py             # Shared CIFAR-10 loading and IID partitioning
+├── training.py               # Shared training, evaluation, GPU config, hyperparams
+├── mtls.py                   # Shared mTLS certificate loading and gRPC patching
 │
 ├── generate_certs.sh         # OpenSSL PKI generation (mTLS certs)
 ├── generate_signing_keys.sh  # OpenSSL RSA key pair generation (signing)
@@ -390,18 +392,25 @@ ZT-Pipeline/
 ├── Dockerfile                # CUDA 12.4 + PyTorch + Flower image
 ├── docker-compose.yml        # Orchestration: server + clients + attacker
 ├── requirements.txt          # Python dependencies
+├── .gitignore                # Ignores certs/, signing_keys/, __pycache__/, etc.
 │
 ├── certs/                    # Generated mTLS certificates (git-ignored)
 │   ├── ca.crt / ca.key
 │   ├── server.crt / server.key
 │   ├── client-0.crt / client-0.key
-│   ├── client-1.crt / client-1.key
-│   └── client-2.crt / client-2.key
+│   └── client-1.crt / client-1.key
 │
 ├── signing_keys/             # Generated RSA signing keys (git-ignored)
 │   ├── client-0.private.pem / client-0.public.pem
-│   ├── client-1.private.pem / client-1.public.pem
-│   └── client-2.private.pem / client-2.public.pem
+│   └── client-1.private.pem / client-1.public.pem
+│
+├── baseline_experiment/      # Insecure control-group implementation
+│   ├── baseline_server.py
+│   ├── baseline_client.py
+│   ├── baseline_malicious_client.py
+│   ├── Dockerfile
+│   ├── docker-compose-baseline.yml
+│   └── docker-compose-baseline-attack.yml
 │
 └── ARCHITECTURE.md           # This document
 ```
@@ -412,12 +421,14 @@ ZT-Pipeline/
 |------|-------|-------------|
 | `model.py` | ~35 | `CifarCNN` — 3 conv layers + 2 FC layers. Input: 3×32×32, Output: 10 classes. Shared between server and clients to ensure parameter count consistency. |
 | `server.py` | ~375 | Flower server entry point. Defines `ZeroTrustFedAvg(FedAvg)` strategy with `aggregate_fit()` implementing Gate 2 + Gate 3 + minimum-accepted quorum. **Deny-by-default**: crashes if mTLS certs are missing. Passes `server_round` to `verify_signature()` for replay protection. |
-| `client.py` | ~280 | Flower client entry point. **Deny-by-default**: crashes without mTLS certs or signing key. GPU-optimised with AMP mixed-precision, TF32, `pin_memory`, `torch.compile`. Signs updates with round-bound replay nonce. |
-| `client_malicious.py` | ~335 | Label-flip / targeted / noise attacker. Holds valid mTLS cert and signing key — designed to pass Gates 1 & 2 but fail Gate 3 (delta-cosine detection). |
-| `poisoned_client.py` | ~238 | Identical to `client.py` except `fit()` injects random noise or scaled weights. Has valid mTLS cert and signing key — designed to pass Gates 1 & 2 but fail Gate 3. |
+| `client.py` | ~140 | Flower client entry point. **Deny-by-default**: crashes without mTLS certs or signing key. Uses shared modules for training (AMP, TF32), mTLS, and data loading. Signs updates with round-bound replay nonce. |
+| `client_malicious.py` | ~200 | Adversarial client supporting four attack modes: `label_flip`, `targeted`, `noise`, and `scale`. Holds valid mTLS cert and signing key — designed to pass Gates 1 & 2 but fail Gate 3 (delta-cosine / Z-score detection). |
 | `signing.py` | ~185 | Utility module: deterministic weight serialization (`numpy.save`), SHA-256 pre-hashing, RSA-PSS sign/verify with **round-bound replay protection**, key I/O. Catches only `InvalidSignature` (not broad `Exception`). |
-| `generate_certs.sh` | ~106 | Bash/OpenSSL script: creates Root CA (4096-bit RSA), signs server + client certificates with SAN extensions. |
-| `generate_signing_keys.sh` | ~55 | Bash/OpenSSL script: generates PKCS#8 RSA-2048 key pairs for each client. |
+| `data_utils.py` | ~50 | Shared CIFAR-10 loading (`get_cifar10()`) and IID partitioning (`partition_data()`). Eliminates duplication across all client files. |
+| `training.py` | ~130 | Shared GPU configuration (TF32, matmul precision), hyperparameters, `train_one_epoch()` with AMP, `evaluate()`, `get_parameters()`/`set_parameters()`, `create_model()` with `torch.compile`. |
+| `mtls.py` | ~45 | Shared mTLS helpers: `load_client_certificates()` and `patch_grpc_for_mtls()`. Used by all ZT client files. |
+| `generate_certs.sh` | ~90 | Bash/OpenSSL script: creates Root CA (4096-bit RSA), signs server + 2 client certificates with SAN extensions. |
+| `generate_signing_keys.sh` | ~55 | Bash/OpenSSL script: generates PKCS#8 RSA-2048 key pairs for each client (default: 2). |
 
 ---
 
@@ -453,14 +464,12 @@ graph TD
     CA["🏛️ FL-Root-CA<br/><i>self-signed, 4096-bit RSA</i>"]
     CA --> SRV["🔒 fl-server<br/>server.crt<br/><i>SAN: server, fl-server,<br/>localhost, 127.0.0.1</i>"]
     CA --> C0["📜 fl-client-0<br/>client-0.crt<br/><i>SAN: client-0, fl-client-0,<br/>localhost</i>"]
-    CA --> C1["📜 fl-client-1<br/>client-1.crt<br/><i>SAN: client-1, fl-client-1,<br/>localhost</i>"]
-    CA --> C2["📜 fl-client-2<br/>client-2.crt<br/><i>SAN: client-2, fl-client-2,<br/>malicious, fl-malicious, localhost</i>"]
+    CA --> C1["📜 fl-client-1<br/>client-1.crt<br/><i>SAN: client-1, fl-client-1,<br/>malicious, fl-malicious, localhost</i>"]
 
     style CA fill:#8e44ad,color:#fff
     style SRV fill:#2c3e50,color:#fff
     style C0 fill:#27ae60,color:#fff
-    style C1 fill:#27ae60,color:#fff
-    style C2 fill:#c0392b,color:#fff
+    style C1 fill:#c0392b,color:#fff
 ```
 
 All certificates are:
@@ -1178,14 +1187,15 @@ Because the malicious delta points in the **opposite direction** to the honest o
 
 ---
 
-### 10.8 `poisoned_client.py` — The Brute-Force Attacker
+### 10.8 Shared Modules — `data_utils.py`, `training.py`, `mtls.py`
 
-A simpler attack model included for comparison:
+These modules eliminate code duplication across the client files:
 
-- **"noise" mode:** Replaces all weights with random Gaussian noise scaled by `POISON_SCALE` (default: 100). Produces weights with dramatically different L2 norms — easily caught by Gate 3's Z-score detection even in Round 1.
-- **"scale" mode:** Trains honestly, then multiplies all weights by 100×. Also caught by norm-based detection.
+- **`data_utils.py`:** CIFAR-10 download/transform and IID partitioning — previously copy-pasted in every client.
+- **`training.py`:** Device detection, GPU config (TF32, matmul precision), hyperparameters (`BATCH_SIZE`, `LEARNING_RATE`, `LOCAL_EPOCHS`), `train_one_epoch()` with AMP, `evaluate()` with autocast, `get_parameters()`/`set_parameters()`, `create_model()` with `torch.compile`, and `train_one_epoch_with_label_transform()` for attack modes.
+- **`mtls.py`:** `load_client_certificates()` reads CA cert, client cert, and client key; `patch_grpc_for_mtls()` monkey-patches Flower's gRPC channel to inject TLS credentials.
 
-**Thesis value:** Shows that Gate 3's Z-score fallback catches even unsophisticated attacks, while the delta-cosine method catches the more sophisticated label-flip attack.
+> **Note on `poisoned_client.py` (removed):** The former `poisoned_client.py` (`noise` and `scale` attack modes) has been merged into `client_malicious.py`, which now supports all four attack modes: `label_flip`, `targeted`, `noise`, and `scale`. The `POISON_SCALE` env var (default `100.0`) controls the scale attack magnitude.
 
 ---
 
@@ -1291,7 +1301,8 @@ The Dockerfile builds a single image used by all services (server, clients, mali
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 # System deps → Python → PyTorch (CUDA 12.4 wheels) → Flower + cryptography
-# Application code: model.py, server.py, client.py, signing.py, poisoned_client.py
+# Application code: model.py, server.py, client.py, client_malicious.py, signing.py
+# Shared modules: data_utils.py, training.py, mtls.py
 ```
 
 PyTorch is installed from the `cu124` index to match the CUDA runtime in the base image.
@@ -1508,13 +1519,12 @@ All configuration is injected via environment variables in `docker-compose.yml`:
 | `ANOMALY_Z_THRESHOLD` | server | `2.0` | Z-score threshold for Gate 3 anomaly detection (round 1 fallback) |
 | `CLIENT_ID` | clients | `0` | Numeric identifier for this client (0-indexed) |
 | `SERVER_ADDRESS` | clients | `server:8080` | gRPC endpoint for the Flower server |
-| `ATTACK_MODE` | `client_malicious.py` | `label_flip` | Attack strategy: `"label_flip"`, `"targeted"`, or `"noise"` |
+| `ATTACK_MODE` | `client_malicious.py` | `label_flip` | Attack strategy: `"label_flip"`, `"targeted"`, `"noise"`, or `"scale"` |
 | `LOCAL_EPOCHS` | `client_malicious.py` | `2` | Attacker local training epochs per round |
 | `SOURCE_LABEL` | `client_malicious.py` | `0` | Source class for targeted flip |
 | `TARGET_LABEL` | `client_malicious.py` | `1` | Target class for targeted flip |
 | `NOISE_SCALE` | `client_malicious.py` | `5.0` | Gaussian noise standard deviation (noise mode) |
-| `POISON_MODE` | `poisoned_client.py` | `noise` | Attack mode: `"noise"` (random) or `"scale"` (amplified) |
-| `POISON_SCALE` | `poisoned_client.py` | `100.0` | Magnitude of the poisoning attack |
+| `POISON_SCALE` | `client_malicious.py` | `100.0` | Magnitude of the scale poisoning attack |
 
 ---
 

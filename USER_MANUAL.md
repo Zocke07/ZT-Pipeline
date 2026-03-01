@@ -117,13 +117,16 @@ ZT-Pipeline/
 ├── server.py
 ├── client.py
 ├── client_malicious.py
-├── poisoned_client.py
 ├── signing.py
+├── data_utils.py
+├── training.py
+├── mtls.py
 ├── generate_certs.sh
 ├── generate_signing_keys.sh
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
+├── .gitignore
 └── ...
 ```
 
@@ -146,7 +149,7 @@ bash generate_certs.sh
 
 1. Creates a **Root Certificate Authority** (`ca.crt` / `ca.key`) — the trust anchor.
 2. Generates a **server certificate** (`server.crt` / `server.key`) signed by the CA.
-3. Generates **per-client certificates** (`client-0.crt`, `client-1.crt`, `client-2.crt`)
+3. Generates **per-client certificates** (`client-0.crt`, `client-1.crt`)
    signed by the same CA.
 4. All certificates include Subject Alternative Names (SANs) that match Docker
    Compose service names — required for gRPC hostname verification.
@@ -159,7 +162,6 @@ bash generate_certs.sh
 ==> Generating certificate for: server (CN=fl-server)
 ==> Generating certificate for: client-0 (CN=fl-client-0)
 ==> Generating certificate for: client-1 (CN=fl-client-1)
-==> Generating certificate for: client-2 (CN=fl-client-2)
 
 ✓ mTLS certificates generated in certs/:
 CA:       certs/ca.crt
@@ -202,9 +204,6 @@ bash generate_signing_keys.sh
 ==> Generating RSA-2048 key pair for client-1...
     ✓ signing_keys/client-1.private.pem
     ✓ signing_keys/client-1.public.pem
-==> Generating RSA-2048 key pair for client-2...
-    ✓ signing_keys/client-2.private.pem
-    ✓ signing_keys/client-2.public.pem
 
 ✓ Signing keys generated in signing_keys/:
 ```
@@ -219,17 +218,14 @@ certs/
 ├── server.key      ← Server private key
 ├── client-0.crt    ← Client 0 identity certificate
 ├── client-0.key    ← Client 0 TLS private key
-├── client-1.crt    ← Client 1 identity certificate
-├── client-1.key    ← Client 1 TLS private key
-└── client-2.crt    ← Client 2 identity certificate (spare)
+├── client-1.crt    ← Client 1 identity certificate (also used by malicious client)
+└── client-1.key    ← Client 1 TLS private key
 
 signing_keys/
 ├── client-0.private.pem   ← Client 0 signing key (stays with client-0 only)
 ├── client-0.public.pem    ← Client 0 public key (shared with server)
 ├── client-1.private.pem   ← Client 1 signing key (stays with client-1 only)
-├── client-1.public.pem    ← Client 1 public key (shared with server)
-├── client-2.private.pem   ← Client 2 signing key (spare)
-└── client-2.public.pem    ← Client 2 public key (spare)
+└── client-1.public.pem    ← Client 1 public key (shared with server)
 ```
 
 > **Security note:** The CA private key (`ca.key`) and each client's private keys

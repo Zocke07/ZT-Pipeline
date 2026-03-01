@@ -83,10 +83,7 @@ generate_cert "client-0" "fl-client-0" \
     "DNS:client-0,DNS:fl-client-0,DNS:localhost"
 
 generate_cert "client-1" "fl-client-1" \
-    "DNS:client-1,DNS:fl-client-1,DNS:localhost"
-
-generate_cert "client-2" "fl-client-2" \
-    "DNS:client-2,DNS:fl-client-2,DNS:malicious,DNS:fl-malicious,DNS:localhost"
+    "DNS:client-1,DNS:fl-client-1,DNS:malicious,DNS:fl-malicious,DNS:localhost"
 
 # ── Cleanup CA serial file ─────────────────────────────────
 rm -f "${CERT_DIR}/ca.srl"

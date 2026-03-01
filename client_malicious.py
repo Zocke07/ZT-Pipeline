@@ -1,4 +1,4 @@
-"""Malicious Flower Client – Label Flipping Attack (+ optional weight noise).
+"""Malicious Flower Client – Simulates adversarial participants.
 
 Simulates an adversarial participant in the federated learning pipeline.
 
@@ -12,22 +12,19 @@ Attack modes (set via ATTACK_MODE env var):
   "label_flip" (default)
        During training, all labels are inverted:
            label → (NUM_CLASSES - 1 - label)
-       i.e., class 0 ↔ class 9, class 1 ↔ class 8, etc.
        Effect: the local gradient points in the opposite direction to
-       what honest training would produce.  The aggregated global model
-       accuracy on the test set degrades toward ~10% (random chance)
-       when the poisoned update is accepted.
+       what honest training would produce.
 
   "targeted"
        Flips only a single source label to a target label:
            SOURCE_LABEL (env) → TARGET_LABEL (env)
-       Subtler attack: harder to detect visually, still triggers
-       directional detection.
 
   "noise"
-       Adds large Gaussian noise directly to the post-training weights
-       (simpler attack, already in poisoned_client.py — included here
-       for comparison in the thesis).
+       Adds large Gaussian noise directly to the post-training weights.
+
+  "scale"
+       Trains normally but multiplies all weights by POISON_SCALE
+       (default: 100×), producing absurdly large update magnitudes.
 
 Thesis note:
     This client deliberately passes cryptographic verification (Gates 1 & 2)
@@ -38,21 +35,28 @@ Thesis note:
 
 import os
 import warnings
-from collections import OrderedDict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List
 
 import numpy as np
-import grpc
 import flwr as fl
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-from model import CifarCNN
+from data_utils import get_cifar10, partition_data
+from mtls import load_client_certificates, patch_grpc_for_mtls
 from signing import sign_parameters, load_private_key
+from training import (
+    BATCH_SIZE,
+    DEVICE,
+    LEARNING_RATE,
+    create_model,
+    create_scaler,
+    evaluate,
+    get_parameters,
+    set_parameters,
+    train_one_epoch,
+    train_one_epoch_with_label_transform,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -60,113 +64,31 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # Configuration
 # ---------------------------------------------------------------------------
 SIGNING_KEY_DIR = Path(os.environ.get("SIGNING_KEY_DIR", "/signing_keys"))
-CERT_DIR        = Path(os.environ.get("CERT_DIR", "/certs"))
+CERT_DIR = Path(os.environ.get("CERT_DIR", "/certs"))
 
-BATCH_SIZE    = 64
-LEARNING_RATE = 0.001
-DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# GPU optimisation: enable TF32 on Ampere+ GPUs (RTX 4000 Ada)
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-ATTACK_MODE   = os.environ.get("ATTACK_MODE",   "label_flip")
-NOISE_SCALE   = float(os.environ.get("NOISE_SCALE", "5.0"))
-SOURCE_LABEL  = int(os.environ.get("SOURCE_LABEL", "0"))
-TARGET_LABEL  = int(os.environ.get("TARGET_LABEL", "1"))
-NUM_CLASSES   = 10
-LOCAL_EPOCHS  = int(os.environ.get("LOCAL_EPOCHS",  "2"))
+ATTACK_MODE = os.environ.get("ATTACK_MODE", "label_flip")
+NOISE_SCALE = float(os.environ.get("NOISE_SCALE", "5.0"))
+POISON_SCALE = float(os.environ.get("POISON_SCALE", "100.0"))
+SOURCE_LABEL = int(os.environ.get("SOURCE_LABEL", "0"))
+TARGET_LABEL = int(os.environ.get("TARGET_LABEL", "1"))
+NUM_CLASSES = 10
+LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "2"))
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Label-flip helpers
 # ---------------------------------------------------------------------------
 
-def _get_cifar10(data_dir: str = "/data"):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2470, 0.2435, 0.2616)),
-    ])
-    train_set = datasets.CIFAR10(data_dir, train=True,  download=True, transform=transform)
-    test_set  = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform)
-    return train_set, test_set
-
-
-def partition_data(train_set, num_clients: int, client_id: int):
-    total      = len(train_set)
-    shard_size = total // num_clients
-    start      = client_id * shard_size
-    return Subset(train_set, list(range(start, start + shard_size)))
-
-
-# ---------------------------------------------------------------------------
-# Attack: Label Flipping training loop
-# ---------------------------------------------------------------------------
-
-def _flip_labels_global(labels: torch.Tensor) -> torch.Tensor:
+def _flip_labels_global(labels):
     """Invert every label: class i → class (NUM_CLASSES-1-i)."""
     return (NUM_CLASSES - 1) - labels
 
 
-def _flip_labels_targeted(labels: torch.Tensor) -> torch.Tensor:
+def _flip_labels_targeted(labels):
     """Flip only SOURCE_LABEL → TARGET_LABEL."""
     flipped = labels.clone()
     flipped[flipped == SOURCE_LABEL] = TARGET_LABEL
     return flipped
-
-
-def train_with_label_flipping(
-    model: nn.Module,
-    loader: DataLoader,
-    flip_fn,
-) -> float:
-    """Train for one epoch with flipped labels. Returns average loss."""
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    running_loss = 0.0
-    for images, labels in loader:
-        images = images.to(DEVICE)
-        labels = flip_fn(labels).to(DEVICE)          # ← ATTACK: swap labels
-        optimizer.zero_grad()
-        loss = criterion(model(images), labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * images.size(0)
-    return running_loss / len(loader.dataset)
-
-
-def train_normal(model: nn.Module, loader: DataLoader) -> float:
-    """Honest training (used in "noise" mode before adding noise)."""
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    running_loss = 0.0
-    for images, labels in loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(images), labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * images.size(0)
-    return running_loss / len(loader.dataset)
-
-
-def evaluate(model: nn.Module, loader: DataLoader) -> Tuple[float, float]:
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            total_loss += criterion(outputs, labels).item() * images.size(0)
-            correct    += (outputs.argmax(dim=1) == labels).sum().item()
-            total      += labels.size(0)
-    return total_loss / total, correct / total
 
 
 # ---------------------------------------------------------------------------
@@ -178,17 +100,19 @@ class MaliciousClient(fl.client.NumPyClient):
 
     The client holds valid mTLS certificates and a legitimate signing key,
     so it appears to be a trusted participant.  However:
-      - In "label_flip" mode it trains on *inverted* labels, causing its
-        weight update delta to point away from the honest training direction.
+      - In "label_flip" mode it trains on *inverted* labels.
       - In "targeted" mode it flips one source class to a target class.
       - In "noise"  mode it trains normally then corrupts weights with noise.
+      - In "scale"  mode it trains normally then multiplies weights by a
+        large factor (default 100×).
     """
 
     def __init__(self, client_id: int, num_clients: int) -> None:
         self.client_id = client_id
-        self.model     = CifarCNN().to(DEVICE)
+        self.model = create_model(compile_model=False)
+        self.scaler = create_scaler()
 
-        train_set, test_set = _get_cifar10()
+        train_set, test_set = get_cifar10()
         self.train_loader = DataLoader(
             partition_data(train_set, num_clients, client_id),
             batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
@@ -214,8 +138,11 @@ class MaliciousClient(fl.client.NumPyClient):
             self._flip_fn = _flip_labels_targeted
             desc = f"TARGETED flip  ({SOURCE_LABEL} → {TARGET_LABEL})"
         else:
-            self._flip_fn = None   # noise mode
-            desc = f"weight NOISE  (σ={NOISE_SCALE})"
+            self._flip_fn = None  # noise / scale mode
+            if ATTACK_MODE == "scale":
+                desc = f"weight SCALE  (×{POISON_SCALE})"
+            else:
+                desc = f"weight NOISE  (σ={NOISE_SCALE})"
 
         print(f"[MALICIOUS {client_id}] 🔴 ATTACK MODE: {ATTACK_MODE}  ({desc})")
         print(f"[MALICIOUS {client_id}] Device: {DEVICE}  |  "
@@ -224,14 +151,10 @@ class MaliciousClient(fl.client.NumPyClient):
     # -- Flower interface ---------------------------------------------------
 
     def get_parameters(self, config) -> List:
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        return get_parameters(self.model)
 
     def set_parameters(self, parameters: List) -> None:
-        state_dict = OrderedDict(
-            {k: torch.from_numpy(np.array(v))
-             for k, v in zip(self.model.state_dict().keys(), parameters)}
-        )
-        self.model.load_state_dict(state_dict, strict=True)
+        set_parameters(self.model, parameters)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -239,17 +162,24 @@ class MaliciousClient(fl.client.NumPyClient):
         if ATTACK_MODE in ("label_flip", "targeted"):
             # ── Attack: train on flipped labels ─────────────────────
             for _ in range(LOCAL_EPOCHS):
-                loss = train_with_label_flipping(
-                    self.model, self.train_loader, self._flip_fn
+                loss = train_one_epoch_with_label_transform(
+                    self.model, self.train_loader, self._flip_fn,
                 )
             poisoned_params = self.get_parameters(config={})
             print(f"  [MALICIOUS] fit loss (on flipped labels): {loss:.4f}  "
                   f"({LOCAL_EPOCHS} epoch(s)) ← anti-correlated update")
+
+        elif ATTACK_MODE == "scale":
+            # ── Attack: honest training + scale weights ─────────────
+            train_one_epoch(self.model, self.train_loader, self.scaler)
+            poisoned_params = [w * POISON_SCALE for w in self.get_parameters(config={})]
+            print(f"  [MALICIOUS] Trained normally then scaled weights by {POISON_SCALE}×")
+
         else:
             # ── Attack: honest training + noise injection ────────────
             for _ in range(LOCAL_EPOCHS):
-                loss = train_normal(self.model, self.train_loader)
-            honest_params  = self.get_parameters(config={})
+                loss = train_one_epoch(self.model, self.train_loader, self.scaler)
+            honest_params = self.get_parameters(config={})
             poisoned_params = [
                 w + np.random.randn(*w.shape).astype(np.float32) * NOISE_SCALE
                 for w in honest_params
@@ -275,49 +205,20 @@ class MaliciousClient(fl.client.NumPyClient):
 
 
 # ---------------------------------------------------------------------------
-# Gate 1: mTLS helpers (identical to client.py)
-# ---------------------------------------------------------------------------
-
-def _load_client_certificates(client_id: int) -> Optional[Tuple[bytes, bytes, bytes]]:
-    ca_path   = CERT_DIR / "ca.crt"
-    cert_path = CERT_DIR / f"client-{client_id}.crt"
-    key_path  = CERT_DIR / f"client-{client_id}.key"
-
-    if not all(p.exists() for p in [ca_path, cert_path, key_path]):
-        print(f"[MALICIOUS {client_id}] ⚠  Certs missing – connecting WITHOUT mTLS")
-        return None
-
-    print(f"[MALICIOUS {client_id}] 🔒 mTLS certs loaded  → Gate 1 WILL pass")
-    return ca_path.read_bytes(), cert_path.read_bytes(), key_path.read_bytes()
-
-
-def _patch_grpc_for_mtls(ca_cert: bytes, client_cert: bytes, client_key: bytes) -> None:
-    _orig = grpc.ssl_channel_credentials
-
-    def _mtls(root_certificates=None, private_key=None, certificate_chain=None):
-        return _orig(
-            root_certificates=root_certificates or ca_cert,
-            private_key=client_key,
-            certificate_chain=client_cert,
-        )
-
-    grpc.ssl_channel_credentials = _mtls
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    client_id   = int(os.environ.get("CLIENT_ID",      "1"))
-    num_clients = int(os.environ.get("NUM_CLIENTS",    "2"))
-    server_addr =     os.environ.get("SERVER_ADDRESS", "server:8080")
+    client_id = int(os.environ.get("CLIENT_ID", "1"))
+    num_clients = int(os.environ.get("NUM_CLIENTS", "2"))
+    server_addr = os.environ.get("SERVER_ADDRESS", "server:8080")
 
     # Gate 1
-    certs = _load_client_certificates(client_id)
+    certs = load_client_certificates(CERT_DIR, client_id)
     if certs is not None:
         ca_cert, client_cert, client_key = certs
-        _patch_grpc_for_mtls(ca_cert, client_cert, client_key)
+        print(f"[MALICIOUS {client_id}] 🔒 mTLS certs loaded  → Gate 1 WILL pass")
+        patch_grpc_for_mtls(ca_cert, client_cert, client_key)
         root_certificates = ca_cert
     else:
         root_certificates = None

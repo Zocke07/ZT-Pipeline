@@ -464,7 +464,7 @@ Apply the findings from a comprehensive security audit covering three criteria:
 | **S1** | `server.py`, `client.py` | Server and clients silently fall back to insecure plaintext gRPC when certs are missing | Both raise `RuntimeError` and refuse to start — **deny-by-default** | _"The system enforces a deny-by-default posture: no entity can participate without valid mTLS credentials."_ |
 | **S3** | `signing.py` | `except Exception` masks all errors as invalid signatures | `except InvalidSignature` — only `cryptography.exceptions.InvalidSignature` is caught | _"By catching only InvalidSignature, programming bugs surface immediately rather than being misclassified."_ |
 | **S4** | `docker-compose.yml` | `./signing_keys:/signing_keys:ro` mounted to every container (server + all clients) | Server mounts only `*.public.pem`; each client mounts only its own `*.private.pem` — **least privilege** | _"Each container receives only the cryptographic material it needs, enforcing least privilege at the infrastructure layer."_ |
-| **S5** | `signing.py`, `server.py`, `client.py`, `client_malicious.py`, `poisoned_client.py` | Signatures cover only weight bytes — no freshness binding | `server_round` (4-byte big-endian nonce) prepended to signed payload — **replay protection** | _"Signatures bind to the federation round, preventing replay of captured updates."_ |
+| **S5** | `signing.py`, `server.py`, `client.py`, `client_malicious.py` | Signatures cover only weight bytes — no freshness binding | `server_round` (4-byte big-endian nonce) prepended to signed payload — **replay protection** | _"Signatures bind to the federation round, preventing replay of captured updates."_ |
 | **S6** | `client.py` | Missing signing key → client participates unsigned | Missing signing key → `RuntimeError` — client **refuses to start** | _"Unsigned clients cannot participate, eliminating the possibility of unauthenticated model updates."_ |
 
 #### Thesis Alignment Fixes
@@ -477,11 +477,11 @@ Apply the findings from a comprehensive security audit covering three criteria:
 
 | ID | File(s) | Change | Expected Impact |
 |----|---------|--------|----------------|
-| **G1** | `client.py`, `client_malicious.py`, `poisoned_client.py` | `torch.tensor(v)` → `torch.from_numpy(np.array(v))` | Zero-copy memory sharing; preserves dtype |
+| **G1** | `client.py`, `client_malicious.py` | `torch.tensor(v)` → `torch.from_numpy(np.array(v))` | Zero-copy memory sharing; preserves dtype |
 | **G2** | `client.py` | Added `torch.amp.autocast("cuda")` + `torch.amp.GradScaler` | FP16 on Tensor Cores: ~2× training throughput |
 | **G3** | `client.py` | Added `pin_memory=True` + `persistent_workers=True` on DataLoaders | Faster async CPU→GPU transfer via `non_blocking=True` |
 | **G4** | `client.py` | Added `torch.compile(model)` when CUDA available | PyTorch 2.x Inductor backend: fused ops, reduced kernel launches |
-| **G5** | `client.py`, `client_malicious.py`, `poisoned_client.py` | Added `torch.backends.cuda.matmul.allow_tf32 = True` | TF32 matmul format: 3× FLOPS vs FP32 on Ampere+ GPUs |
+| **G5** | `client.py`, `client_malicious.py` | Added `torch.backends.cuda.matmul.allow_tf32 = True` | TF32 matmul format: 3× FLOPS vs FP32 on Ampere+ GPUs |
 | **G6** | `client.py` | `optimizer.zero_grad()` → `optimizer.zero_grad(set_to_none=True)` | Avoids memset; marginal speedup per iteration |
 
 ### New Environment Variables
@@ -505,8 +505,7 @@ Passes the round number to clients so they can include it in the signed payload 
 | `signing.py` | Import `InvalidSignature`; `sign_parameters()` and `verify_signature()` accept `server_round` kwarg; round nonce prepended to digest; catch narrowed to `InvalidSignature` |
 | `server.py` | `_load_certificates()` raises `RuntimeError` on missing certs; `ZeroTrustFedAvg.__init__()` accepts `min_accepted`; `aggregate_fit()` passes `server_round` to verify; minimum accepted guard added; `on_fit_config_fn` lambda added |
 | `client.py` | Added `numpy` import; TF32 + float32 precision config; `train_one_epoch` uses AMP scaler; `evaluate` uses `autocast`; `CifarClient.__init__` adds `torch.compile`, `GradScaler`, `pin_memory`, `persistent_workers`; signing key and mTLS are mandatory (`RuntimeError`); `fit()` passes `server_round`; `set_parameters` uses `torch.from_numpy`; `main()` deny-by-default for mTLS |
-| `client_malicious.py` | TF32 config; `set_parameters` uses `torch.from_numpy`; `fit()` passes `server_round` to `sign_parameters` |
-| `poisoned_client.py` | TF32 config; `set_parameters` uses `torch.from_numpy`; `fit()` passes `server_round` to `sign_parameters` |
+| `client_malicious.py` | TF32 config; `set_parameters` uses `torch.from_numpy`; `fit()` passes `server_round` to `sign_parameters`; now also supports `noise` and `scale` attack modes (merged from former `poisoned_client.py`) |
 | `docker-compose.yml` | Server mounts only `*.public.pem`; client-0 mounts only `client-0.private.pem`; malicious mounts only `client-1.private.pem`; client-1 (clean profile) mounts only `client-1.private.pem`; added `MIN_ACCEPTED=2` env var |
 
 ### Expected Verification Plan
