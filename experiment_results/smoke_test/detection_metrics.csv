@@ -1,0 +1,2 @@
+total_tp,total_fp,total_fn,total_tn,tpr,fpr,precision,recall,f1_score
+2,0,4,6,0.3333,0.0,1.0,0.3333,0.5

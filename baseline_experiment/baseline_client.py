@@ -24,9 +24,8 @@ import warnings
 from typing import List
 
 import flwr as fl
-from torch.utils.data import DataLoader
 
-from data_utils import get_cifar10, partition_data
+from data_utils import make_dataloaders
 from training import (
     BATCH_SIZE,
     DEVICE,
@@ -35,6 +34,7 @@ from training import (
     evaluate,
     get_parameters,
     set_parameters,
+    set_seed,
     train_one_epoch,
 )
 
@@ -57,16 +57,15 @@ class BaselineCifarClient(fl.client.NumPyClient):
         self.model = create_model(compile_model=True)
         self.scaler = create_scaler()
 
-        use_pin = DEVICE.type == "cuda"
-        train_set, test_set = get_cifar10()
-        self.train_loader = DataLoader(
-            partition_data(train_set, num_clients, client_id),
-            batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
-            pin_memory=use_pin, persistent_workers=True,
-        )
-        self.test_loader = DataLoader(
-            test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
-            pin_memory=use_pin, persistent_workers=True,
+        # Data loading
+        _seed = int(os.environ.get("SEED", "0"))
+        _alpha_str = os.environ.get("DIRICHLET_ALPHA", "")
+        self.train_loader, self.test_loader = make_dataloaders(
+            client_id, num_clients,
+            dirichlet_alpha=float(_alpha_str) if _alpha_str else None,
+            seed=_seed,
+            batch_size=BATCH_SIZE,
+            pin_memory=(DEVICE.type == "cuda"),
         )
 
         print(f"[Baseline Client {client_id}] Device: {DEVICE}  |  "
@@ -103,6 +102,13 @@ def main() -> None:
     client_id = int(os.environ.get("CLIENT_ID", "0"))
     num_clients = int(os.environ.get("NUM_CLIENTS", "2"))
     server_addr = os.environ.get("SERVER_ADDRESS", "server:8080")
+
+    # Reproducibility: seed control
+    seed = int(os.environ.get("SEED", "-1"))
+    if seed >= 0:
+        effective_seed = seed * 10000 + client_id
+        set_seed(effective_seed)
+        print(f"[Baseline Client {client_id}] Seed set: {effective_seed} (base={seed})")
 
     print(f"[Baseline Client {client_id}] Connecting INSECURELY to {server_addr}")
     print(f"[Baseline Client {client_id}] No mTLS  |  No Signatures")

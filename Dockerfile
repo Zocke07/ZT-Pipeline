@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY model.py server.py client.py signing.py client_malicious.py ./
+COPY model.py server.py client.py signing.py client_malicious.py server_utils.py ./
 COPY data_utils.py training.py mtls.py ./
 
 # Default: print usage

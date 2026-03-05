@@ -45,7 +45,7 @@ services:
     environment:
       - NUM_CLIENTS=2
       - MIN_CLIENTS=2
-      - NUM_ROUNDS=3
+      - NUM_ROUNDS=20
     deploy:
       resources:
         reservations:

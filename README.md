@@ -25,21 +25,24 @@ Federated Learning allows multiple clients to collaboratively train a shared mod
 ```
 ZT-Pipeline/
 ├── server.py                   # ZT aggregation server (three-gate pipeline)
+├── server_utils.py             # Shared server utilities (metrics, Krum, model saving)
 ├── client.py                   # Honest FL client
 ├── client_malicious.py         # Adversarial client (label_flip / targeted / noise / scale)
-├── model.py                    # CNN model (CIFAR-10)
+├── model.py                    # CifarCNN model definition
 ├── signing.py                  # RSA-PSS sign & verify helpers
-├── data_utils.py               # Shared CIFAR-10 loading and IID partitioning
-├── training.py                 # Shared training, evaluation, and GPU configuration
-├── mtls.py                     # Shared mTLS certificate loading and gRPC patching
-├── run_experiment.py           # Orchestrates Experiment A vs. Experiment B
+├── data_utils.py               # CIFAR-10 loading, partitioning, DataLoader factory
+├── training.py                 # Training loop, evaluation, and GPU configuration
+├── mtls.py                     # mTLS certificate loading and gRPC channel patching
+├── generate_keys.py            # Generates mTLS certs and RSA signing keys
+├── run_experiments.py          # Primary experiment orchestrator (multi-seed, multi-config)
+├── run_experiment.py           # Single-run orchestrator (legacy; kept for reference)
 ├── verify_system_deployment.py # Pre-flight deployment checks
-├── generate_certs.sh           # Generates mTLS certificates (Gate 1 key material)
-├── generate_signing_keys.sh    # Generates RSA signing keys (Gate 2 key material)
 ├── Dockerfile                  # Container image (PyTorch 2.5.1, CUDA 12.4)
 ├── docker-compose.yml          # Service orchestration (server + clients)
-├── experiment_override.yml     # Docker Compose overrides for experiment runs
+├── experiment_override.yml     # Docker Compose overrides for experiment parameters
 ├── requirements.txt            # Python dependencies
+├── tracking/
+│   └── mlflow_logger.py        # MLflow ExperimentTracker and NullTracker wrappers
 └── baseline_experiment/        # Insecure control-group implementation
     ├── baseline_server.py
     ├── baseline_client.py
@@ -52,10 +55,11 @@ ZT-Pipeline/
 
 ## Technology Stack
 
-- **Federated Learning:** [Flower](https://flower.ai/) (flwr 1.13.1) with FedAvg strategy
-- **Deep Learning:** PyTorch 2.5.1, torchvision 0.20.1, CUDA 12.4, AMP mixed precision
-- **Dataset:** CIFAR-10, IID-partitioned across clients
+- **Federated Learning:** [Flower](https://flower.ai/) (flwr 1.13.1) with custom ZeroTrustFedAvg strategy
+- **Deep Learning:** PyTorch 2.5.1, torchvision 0.20.1, CUDA 12.4, AMP mixed precision, `torch.compile`
+- **Dataset:** CIFAR-10, Dirichlet-partitioned across clients (configurable α)
 - **Security:** `cryptography` library (RSA-PSS), gRPC with mTLS channel credentials
+- **Experiment tracking:** MLflow (local tracking server, auto-logged per run)
 - **Infrastructure:** Docker, Docker Compose, NVIDIA Container Toolkit (GPU passthrough)
 - **Host OS:** Windows 11 with WSL2 + Docker Desktop
 
@@ -71,11 +75,10 @@ ZT-Pipeline/
 
 ### 1. Generate Cryptographic Material
 
-Run these once in Git Bash or WSL2:
+Run once from the repository root:
 
-```bash
-bash generate_certs.sh          # mTLS certificates → certs/
-bash generate_signing_keys.sh   # RSA signing keys  → signing_keys/
+```powershell
+python generate_keys.py         # mTLS certs → certs/   RSA keys → signing_keys/
 ```
 
 ### 2. Build the Container Image
@@ -84,35 +87,45 @@ bash generate_signing_keys.sh   # RSA signing keys  → signing_keys/
 docker compose build
 ```
 
-### 3. Run the Full Experiment
+### 3. Run the Experiment Suite
 
 ```powershell
-# Experiment B: Zero-Trust pipeline under attack
-docker compose up
+# Recommended: full multi-seed, multi-config experiment run
+python run_experiments.py --preset smoke
 
-# Or run both experiments (baseline + ZT) via the orchestrator
-python run_experiment.py
+# Single ad-hoc run (ZT pipeline under label-flip attack)
+docker compose up
 ```
+
+Results land in `experiment_results/` and are tracked in MLflow (`mlruns/`).
 
 ---
 
 ## Experiments
 
-| Experiment | Description |
-|------------|-------------|
-| **A — Baseline (insecure)** | Standard FL with no authentication or validation; adversarial clients can freely poison the global model |
-| **B — ZT Pipeline (secure)** | All three gates active; adversarial updates are detected and rejected before aggregation |
+`run_experiments.py` executes a matrix of configurations across multiple random seeds and produces aggregated detection metrics.
 
-Results are written to `results.json` and compared to quantify the accuracy degradation each approach suffers under attack.
+| Configuration | Gates active | Aggregation | Attack |
+|--------------|-------------|-------------|--------|
+| baseline_clean | none | FedAvg | none |
+| baseline_attack | none | FedAvg | configurable |
+| zt_no_gates | none | FedAvg | configurable |
+| zt_gate1_only | Gate 1 | FedAvg | configurable |
+| zt_gates12 | Gate 1+2 | FedAvg | configurable |
+| zt_full | Gate 1+2+3 | FedAvg | configurable |
+| zt_full_krum | Gate 1+2+3 | Krum | configurable |
+| zt_full_multikrum | Gate 1+2+3 | Multi-Krum | configurable |
+
+Final metrics (accuracy, detection rate, precision, recall, F1) are written to `experiment_results/<preset>/`.
 
 ---
 
 ## Attack Modes
 
-The adversarial client (`client_malicious.py`) supports four attack modes, controlled via the `ATTACK_TYPE` environment variable:
+The adversarial client (`client_malicious.py`) supports four attack modes, controlled via the `ATTACK_MODE` environment variable:
 
-| Mode | Description |
-|------|-------------|
+| `ATTACK_MODE` | Description |
+|--------------|-------------|
 | `label_flip` | Relabels all training samples to a target class |
 | `targeted` | Flips one specific source class to a target class |
 | `noise` | Injects Gaussian noise into model weights |

@@ -28,7 +28,7 @@ from typing import List, Optional
 import numpy as np
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
+from cryptography.hazmat.primitives.asymmetric import padding, utils
 
 
 # ---------------------------------------------------------------------------
@@ -50,35 +50,6 @@ def serialize_parameters(parameters: List[np.ndarray]) -> bytes:
 def _digest(data: bytes) -> bytes:
     """Compute SHA-256 digest (used for pre-hashing before RSA-PSS)."""
     return hashlib.sha256(data).digest()
-
-
-# ---------------------------------------------------------------------------
-# Key generation  (used by generate_signing_keys.py)
-# ---------------------------------------------------------------------------
-
-def generate_key_pair(key_dir: Path, name: str, key_size: int = 2048) -> None:
-    """Generate an RSA key pair and write PEM files to *key_dir*.
-
-    Produces:
-        ``{name}.private.pem``  – PKCS8 private key (unencrypted)
-        ``{name}.public.pem``   – SubjectPublicKeyInfo public key
-    """
-    key_dir.mkdir(parents=True, exist_ok=True)
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
-
-    (key_dir / f"{name}.private.pem").write_bytes(
-        private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-    )
-    (key_dir / f"{name}.public.pem").write_bytes(
-        private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-    )
 
 
 # ---------------------------------------------------------------------------

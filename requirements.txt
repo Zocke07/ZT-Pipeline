@@ -4,3 +4,5 @@ cryptography>=42.0.0
 torch==2.5.1
 torchvision==0.20.1
 numpy<2
+matplotlib>=3.7.0
+mlflow>=2.12.0

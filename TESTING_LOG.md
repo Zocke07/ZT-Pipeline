@@ -151,9 +151,9 @@ fl-client-1 | [mTLS] ✓  gRPC patched – client certificate will be presented 
 
 ### How to Reproduce
 
-```bash
-# Generate certificates (requires bash + openssl, e.g. Git Bash on Windows)
-bash generate_certs.sh
+```powershell
+# Generate certificates (now requires Python only — no bash/openssl on PATH needed)
+python generate_keys.py
 
 # Build & run
 docker compose build
@@ -262,17 +262,9 @@ fl-server  | [Gate 2] Round 3: 2 accepted, 0 rejected
 
 ### How to Reproduce
 
-```bash
-# Generate signing keys (requires bash + openssl, e.g. Git Bash on Windows)
-bash generate_signing_keys.sh
-
-# Or via Docker if no local openssl:
-docker run --rm -v "${PWD}/signing_keys:/signing_keys" alpine sh -c \
-  "apk add --no-cache openssl > /dev/null 2>&1 && \
-   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /signing_keys/client-0.private.pem && \
-   openssl pkey -in /signing_keys/client-0.private.pem -pubout -out /signing_keys/client-0.public.pem && \
-   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /signing_keys/client-1.private.pem && \
-   openssl pkey -in /signing_keys/client-1.private.pem -pubout -out /signing_keys/client-1.public.pem"
+```powershell
+# Generate signing keys (now requires Python only)
+python generate_keys.py
 
 # Build & run (two-step with data-init)
 docker compose build
@@ -882,7 +874,7 @@ docker compose logs <service-name>
 docker compose run --rm server ls -la /certs/
 
 # Re-generate if expired or corrupted
-bash generate_certs.sh
+python generate_keys.py
 
 # Check cert validity
 openssl x509 -in certs/server.crt -noout -dates -subject

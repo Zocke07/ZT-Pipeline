@@ -11,9 +11,31 @@ __pycache__/
 dist/
 build/
 *.egg
+.venv/
 
-# ── Experiment outputs ───────────────────────────────────
+# ── Dataset files ─────────────────────────────────────────
+data/
+
+# ── Experiment outputs ────────────────────────────────────
 results.json
+experiment_results/
+experiment_staging/
+
+# ── MLflow tracking ───────────────────────────────────────
+mlruns/
+
+# ── Trained model artifacts ───────────────────────────────
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.npz
+*.npy
 
 # ── OS / IDE ─────────────────────────────────────────────
 .DS_Store

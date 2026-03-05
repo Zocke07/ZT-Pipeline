@@ -1,0 +1,54 @@
+{
+  "seed": 123,
+  "num_rounds": 3,
+  "num_clients": 2,
+  "enable_gate1": true,
+  "enable_gate2": true,
+  "enable_gate3": true,
+  "z_threshold": 2.0,
+  "aggregation_method": "fedavg",
+  "num_attackers": 1,
+  "round_metrics": [
+    {
+      "round": 1,
+      "gate2_passed": 2,
+      "gate2_rejected": 0,
+      "gate3_accepted": 2,
+      "gate3_rejected": 0,
+      "gate3_rejected_cids": [],
+      "aggregation_skipped": false,
+      "aggregation_method": "fedavg",
+      "num_clients_reporting": 2,
+      "global_loss": 1.9286956191062927,
+      "global_accuracy": 0.215
+    },
+    {
+      "round": 2,
+      "gate2_passed": 2,
+      "gate2_rejected": 0,
+      "gate3_accepted": 1,
+      "gate3_rejected": 1,
+      "gate3_rejected_cids": [
+        "1"
+      ],
+      "aggregation_skipped": false,
+      "aggregation_method": "fedavg",
+      "num_clients_reporting": 2,
+      "global_loss": 1.0421924591064453,
+      "global_accuracy": 0.6302
+    },
+    {
+      "round": 3,
+      "gate2_passed": 2,
+      "gate2_rejected": 0,
+      "gate3_accepted": 2,
+      "gate3_rejected": 0,
+      "gate3_rejected_cids": [],
+      "aggregation_skipped": false,
+      "aggregation_method": "fedavg",
+      "num_clients_reporting": 2,
+      "global_loss": 1.612991452217102,
+      "global_accuracy": 0.2838
+    }
+  ]
+}

@@ -209,10 +209,10 @@ def phase1_environment_audit(report: TestResult) -> bool:
     missing_certs = [f for f in REQUIRED_CERTS if not (PROJECT_ROOT / f).exists()]
     if missing_certs:
         # Attempt to generate
-        gen_script = PROJECT_ROOT / "generate_certs.sh"
+        gen_script = PROJECT_ROOT / "generate_keys.py"
         if gen_script.exists():
             print("         Certificates missing — attempting generation …")
-            r = _run(["bash", str(gen_script)], timeout=30, cwd=str(PROJECT_ROOT))
+            r = _run([sys.executable, str(gen_script)], timeout=60, cwd=str(PROJECT_ROOT))
             missing_certs = [f for f in REQUIRED_CERTS if not (PROJECT_ROOT / f).exists()]
     certs_ok = len(missing_certs) == 0
     detail = "" if certs_ok else f"Missing: {missing_certs}"
@@ -221,10 +221,10 @@ def phase1_environment_audit(report: TestResult) -> bool:
     # ── 1.5  Signing keys present ─────────────────────────────
     missing_keys = [f for f in REQUIRED_SIGNING_KEYS if not (PROJECT_ROOT / f).exists()]
     if missing_keys:
-        gen_script = PROJECT_ROOT / "generate_signing_keys.sh"
+        gen_script = PROJECT_ROOT / "generate_keys.py"
         if gen_script.exists():
             print("         Signing keys missing — attempting generation …")
-            r = _run(["bash", str(gen_script)], timeout=30, cwd=str(PROJECT_ROOT))
+            r = _run([sys.executable, str(gen_script)], timeout=60, cwd=str(PROJECT_ROOT))
             missing_keys = [f for f in REQUIRED_SIGNING_KEYS if not (PROJECT_ROOT / f).exists()]
     keys_ok = len(missing_keys) == 0
     detail = "" if keys_ok else f"Missing: {missing_keys}"
@@ -237,7 +237,7 @@ def phase1_environment_audit(report: TestResult) -> bool:
             r = _run(["openssl", "x509", "-in", str(ca_crt), "-noout",
                        "-checkend", "0"], timeout=10)
             cert_valid = r.returncode == 0
-            detail = "Certificate not expired" if cert_valid else "CA certificate is EXPIRED — regenerate with generate_certs.sh"
+            detail = "Certificate not expired" if cert_valid else "CA certificate is EXPIRED — regenerate with: python generate_keys.py"
             ok &= report.record("CA certificate not expired", cert_valid, detail)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             # openssl not on host PATH — skip gracefully

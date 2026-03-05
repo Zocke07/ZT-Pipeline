@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy shared modules + baseline scripts (no signing.py, no certs)
-COPY model.py data_utils.py training.py ./
+COPY model.py data_utils.py training.py server_utils.py ./
 COPY baseline_experiment/baseline_server.py ./
 COPY baseline_experiment/baseline_client.py ./
 COPY baseline_experiment/baseline_malicious_client.py ./

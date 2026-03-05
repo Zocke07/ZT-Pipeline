@@ -4,6 +4,8 @@ Provides GPU configuration, hyperparameters, and common train/eval
 functions used across all client variants.
 """
 
+import os
+import random
 from collections import OrderedDict
 from typing import List, Tuple
 
@@ -31,6 +33,32 @@ if torch.cuda.is_available():
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 LOCAL_EPOCHS = 1
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility – seed control
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    """Set all random seeds for full reproducibility.
+
+    Seeds:  Python ``random``, NumPy, PyTorch CPU, PyTorch CUDA (all devices).
+    Enables deterministic CuDNN and disables benchmark mode.
+
+    Known sources of non-determinism that **cannot** be fully controlled:
+      - Certain CUDA atomicAdd operations in backward passes
+      - ``torch.nn.functional.interpolate`` with some modes
+      - Sparse-dense matrix multiplications on CUDA
+      - Non-deterministic reduction order in multi-threaded DataLoader workers
+    See: https://pytorch.org/docs/stable/notes/randomness.html
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
 
 # ---------------------------------------------------------------------------

@@ -121,8 +121,8 @@ ZT-Pipeline/
 ├── data_utils.py
 ├── training.py
 ├── mtls.py
-├── generate_certs.sh
-├── generate_signing_keys.sh
+├── generate_keys.py
+├── server_utils.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -135,14 +135,10 @@ ZT-Pipeline/
 This is the **most critical step**. Without certificates and signing keys, the
 entire security pipeline refuses to start (deny-by-default design).
 
-#### 2.2.1 Generate mTLS Certificates (Gate 1 — Identity)
+From the repository root, run:
 
-Open **Git Bash** (or a WSL2 terminal) and run:
-
-```bash
-cd /d/Z/Master/Code/Exp/ZT-Pipeline   # adjust to your path
-
-bash generate_certs.sh
+```powershell
+python generate_keys.py
 ```
 
 **What this does:**
@@ -150,24 +146,24 @@ bash generate_certs.sh
 1. Creates a **Root Certificate Authority** (`ca.crt` / `ca.key`) — the trust anchor.
 2. Generates a **server certificate** (`server.crt` / `server.key`) signed by the CA.
 3. Generates **per-client certificates** (`client-0.crt`, `client-1.crt`)
-   signed by the same CA.
-4. All certificates include Subject Alternative Names (SANs) that match Docker
-   Compose service names — required for gRPC hostname verification.
+   signed by the same CA, with SANs matching Docker Compose service names.
+4. Generates a **2048-bit RSA key pair** for each client.
+   Private keys (`*.private.pem`) stay with each client; public keys go to the server.
 
 **Expected output:**
 
 ```
-==> Creating certificate directory: certs/
-==> Generating Root CA...
-==> Generating certificate for: server (CN=fl-server)
-==> Generating certificate for: client-0 (CN=fl-client-0)
-==> Generating certificate for: client-1 (CN=fl-client-1)
-
 ✓ mTLS certificates generated in certs/:
 CA:       certs/ca.crt
 Server:   certs/server.crt  +  certs/server.key
 Client-0: certs/client-0.crt  +  certs/client-0.key
 Client-1: certs/client-1.crt  +  certs/client-1.key
+
+✓ Signing keys generated in signing_keys/:
+    signing_keys/client-0.private.pem
+    signing_keys/client-0.public.pem
+    signing_keys/client-1.private.pem
+    signing_keys/client-1.public.pem
 ```
 
 **Verify** (optional):
@@ -178,34 +174,6 @@ openssl verify -CAfile certs/ca.crt certs/server.crt
 
 openssl verify -CAfile certs/ca.crt certs/client-0.crt
 # Expected: certs/client-0.crt: OK
-```
-
-#### 2.2.2 Generate RSA Signing Keys (Gate 2 — Integrity)
-
-Still in Git Bash / WSL2:
-
-```bash
-bash generate_signing_keys.sh
-```
-
-**What this does:**
-
-1. Generates a **2048-bit RSA key pair** for each client.
-2. Private keys (`*.private.pem`) stay with their respective client containers.
-3. Public keys (`*.public.pem`) are shared with the server for verification.
-
-**Expected output:**
-
-```
-==> Creating signing key directory: signing_keys/
-==> Generating RSA-2048 key pair for client-0...
-    ✓ signing_keys/client-0.private.pem
-    ✓ signing_keys/client-0.public.pem
-==> Generating RSA-2048 key pair for client-1...
-    ✓ signing_keys/client-1.private.pem
-    ✓ signing_keys/client-1.public.pem
-
-✓ Signing keys generated in signing_keys/:
 ```
 
 After both scripts, your `certs/` and `signing_keys/` directories should be populated:
@@ -659,11 +627,11 @@ grpc._channel._InactiveRpcError: <_InactiveRpcError ... StatusCode.UNAVAILABLE
 
 | Cause | Fix |
 |-------|-----|
-| Certificates not generated | Run `bash generate_certs.sh` |
-| Certificates expired (older than 365 days) | Re-run `bash generate_certs.sh` to regenerate |
+| Certificates not generated | Run `python generate_keys.py` |
+| Certificates expired (older than 365 days) | Re-run `python generate_keys.py` to regenerate |
 | Certs generated but not mounted | Check `docker-compose.yml` has `./certs:/certs:ro` for each service |
 | Server started before certs exist | Ensure `certs/` directory is populated before `docker compose up` |
-| SAN mismatch | Certificates must include `DNS:server` for the Docker Compose service name. Re-run `generate_certs.sh`. |
+| SAN mismatch | Certificates must include `DNS:server` for the Docker Compose service name. Re-run `python generate_keys.py`. |
 
 **Verify certificates are valid:**
 
@@ -754,10 +722,9 @@ Then rebuild: `docker compose build --no-cache`
 
 **Fix:**
 
-1. Make sure you ran **both** generation scripts:
-   ```bash
-   bash generate_certs.sh
-   bash generate_signing_keys.sh
+1. Make sure you ran the key generation script:
+   ```powershell
+   python generate_keys.py
    ```
 
 2. Verify the files exist:
@@ -815,8 +782,7 @@ TLS-encrypted payloads simultaneously.
 docker compose down -v --remove-orphans
 
 # Regenerate all cryptographic material
-bash generate_certs.sh
-bash generate_signing_keys.sh
+python generate_keys.py
 
 # Rebuild from scratch (no cache)
 docker compose build --no-cache
@@ -832,5 +798,5 @@ docker compose up --abort-on-container-exit
 
 > **End of User Manual.**
 >
-> For architecture details, see `COMBINED_ARCHITECTURE_GUIDE.md`.
+> For architecture details, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 > For phase-by-phase test results, see `TESTING_LOG.md`.

@@ -1,0 +1,113 @@
+services:
+  data-init:
+    build:
+      context: D:/Z/Master/Code/Exp/ZT-Pipeline
+      dockerfile: Dockerfile
+    image: zt-fl-experiment
+    command: >
+      python -c "from torchvision import datasets, transforms;
+      datasets.CIFAR10('/data', train=True,  download=True,
+        transform=transforms.ToTensor());
+      datasets.CIFAR10('/data', train=False, download=True,
+        transform=transforms.ToTensor());
+      print('CIFAR-10 ready.')"
+    volumes:
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/data:/data
+    restart: "no"
+
+  server:
+    build:
+      context: D:/Z/Master/Code/Exp/ZT-Pipeline
+      dockerfile: Dockerfile
+    image: zt-fl-experiment
+    command: python server.py
+    environment:
+      - NUM_CLIENTS=2
+      - MIN_CLIENTS=2
+      - NUM_ROUNDS=3
+      - SEED=123
+      - RESULTS_DIR=/results
+      - AGGREGATION_METHOD=fedavg
+      - NUM_ATTACKERS=1
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+      - MIN_ACCEPTED=1
+      - ANOMALY_Z_THRESHOLD=2.0
+      - ENABLE_GATE2=true
+      - ENABLE_GATE3=true
+    volumes:
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/seed_123/results:/results
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/certs:/certs:ro
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/signing_keys/client-0.public.pem:/signing_keys/client-0.public.pem:ro
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/signing_keys/client-1.public.pem:/signing_keys/client-1.public.pem:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  client-0:
+    build:
+      context: D:/Z/Master/Code/Exp/ZT-Pipeline
+      dockerfile: Dockerfile
+    image: zt-fl-experiment
+    command: >
+      sh -c "sleep 5 && python client.py"
+    environment:
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - SEED=123
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+    volumes:
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/data:/data
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/certs:/certs:ro
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/signing_keys/client-0.private.pem:/signing_keys/client-0.private.pem:ro
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  malicious-0:
+    build:
+      context: D:/Z/Master/Code/Exp/ZT-Pipeline
+      dockerfile: Dockerfile
+    image: zt-fl-experiment
+    command: >
+      sh -c "sleep 12 && python client_malicious.py"
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - SERVER_ADDRESS=server:8080
+      - SEED=123
+      - ATTACK_MODE=label_flip
+      - LOCAL_EPOCHS=2
+      - CERT_DIR=/certs
+      - SIGNING_KEY_DIR=/signing_keys
+    volumes:
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/data:/data
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/certs:/certs:ro
+      - D:/Z/Master/Code/Exp/ZT-Pipeline/experiment_staging/smoke_test/signing_keys/client-1.private.pem:/signing_keys/client-1.private.pem:ro
+    depends_on:
+      server:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

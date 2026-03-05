@@ -40,20 +40,19 @@ from typing import List
 
 import numpy as np
 import flwr as fl
-from torch.utils.data import DataLoader
 
-from data_utils import get_cifar10, partition_data
+from data_utils import make_dataloaders, flip_labels_global, flip_labels_targeted
 from mtls import load_client_certificates, patch_grpc_for_mtls
 from signing import sign_parameters, load_private_key
 from training import (
     BATCH_SIZE,
     DEVICE,
-    LEARNING_RATE,
     create_model,
     create_scaler,
     evaluate,
     get_parameters,
     set_parameters,
+    set_seed,
     train_one_epoch,
     train_one_epoch_with_label_transform,
 )
@@ -73,22 +72,6 @@ SOURCE_LABEL = int(os.environ.get("SOURCE_LABEL", "0"))
 TARGET_LABEL = int(os.environ.get("TARGET_LABEL", "1"))
 NUM_CLASSES = 10
 LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "2"))
-
-
-# ---------------------------------------------------------------------------
-# Label-flip helpers
-# ---------------------------------------------------------------------------
-
-def _flip_labels_global(labels):
-    """Invert every label: class i → class (NUM_CLASSES-1-i)."""
-    return (NUM_CLASSES - 1) - labels
-
-
-def _flip_labels_targeted(labels):
-    """Flip only SOURCE_LABEL → TARGET_LABEL."""
-    flipped = labels.clone()
-    flipped[flipped == SOURCE_LABEL] = TARGET_LABEL
-    return flipped
 
 
 # ---------------------------------------------------------------------------
@@ -112,13 +95,15 @@ class MaliciousClient(fl.client.NumPyClient):
         self.model = create_model(compile_model=False)
         self.scaler = create_scaler()
 
-        train_set, test_set = get_cifar10()
-        self.train_loader = DataLoader(
-            partition_data(train_set, num_clients, client_id),
-            batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
-        )
-        self.test_loader = DataLoader(
-            test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+        # Data loading
+        _seed = int(os.environ.get("SEED", "0"))
+        _alpha_str = os.environ.get("DIRICHLET_ALPHA", "")
+        self.train_loader, self.test_loader = make_dataloaders(
+            client_id, num_clients,
+            dirichlet_alpha=float(_alpha_str) if _alpha_str else None,
+            seed=_seed,
+            batch_size=BATCH_SIZE,
+            num_workers=0,
         )
 
         # Gate 2: Load legitimate signing key (so signatures pass)
@@ -132,10 +117,12 @@ class MaliciousClient(fl.client.NumPyClient):
 
         # Select attack function
         if ATTACK_MODE == "label_flip":
-            self._flip_fn = _flip_labels_global
+            self._flip_fn = flip_labels_global
             desc = "GLOBAL label flip  (label → 9-label)"
         elif ATTACK_MODE == "targeted":
-            self._flip_fn = _flip_labels_targeted
+            self._flip_fn = lambda labels: flip_labels_targeted(
+                labels, SOURCE_LABEL, TARGET_LABEL
+            )
             desc = f"TARGETED flip  ({SOURCE_LABEL} → {TARGET_LABEL})"
         else:
             self._flip_fn = None  # noise / scale mode
@@ -212,6 +199,13 @@ def main() -> None:
     client_id = int(os.environ.get("CLIENT_ID", "1"))
     num_clients = int(os.environ.get("NUM_CLIENTS", "2"))
     server_addr = os.environ.get("SERVER_ADDRESS", "server:8080")
+
+    # Reproducibility: seed control
+    seed = int(os.environ.get("SEED", "-1"))
+    if seed >= 0:
+        effective_seed = seed * 10000 + client_id
+        set_seed(effective_seed)
+        print(f"[MALICIOUS {client_id}] Seed set: {effective_seed} (base={seed})")
 
     # Gate 1
     certs = load_client_certificates(CERT_DIR, client_id)

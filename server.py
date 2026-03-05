@@ -18,19 +18,27 @@ from the population mean are flagged as potentially poisoned and rejected.
 import os
 from logging import WARNING
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import flwr as fl
 from flwr.common import (
     FitRes,
+    ndarrays_to_parameters,
     parameters_to_ndarrays,
 )
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 from flwr.common.logger import log
 
+from server_utils import (
+    MetricsCollector,
+    krum_aggregate,
+    save_round_model,
+    weighted_eval_metrics,
+)
 from signing import verify_signature, load_client_public_keys
+from training import set_seed
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,9 +46,23 @@ from signing import verify_signature, load_client_public_keys
 CERT_DIR = Path(os.environ.get("CERT_DIR", "/certs"))
 SIGNING_KEY_DIR = Path(os.environ.get("SIGNING_KEY_DIR", "/signing_keys"))
 NUM_CLIENTS = int(os.environ.get("NUM_CLIENTS", "2"))
+NUM_ROUNDS = int(os.environ.get("NUM_ROUNDS", "20"))
+
+# Gate ablation toggles  (server-side enforcement)
+ENABLE_GATE2 = os.environ.get("ENABLE_GATE2", "true").lower() == "true"
+ENABLE_GATE3 = os.environ.get("ENABLE_GATE3", "true").lower() == "true"
+
+# Reproducibility
+SEED = int(os.environ.get("SEED", "-1"))
+
+# Structured results output
+RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/results"))
 
 # Gate 3 tunables
 ANOMALY_Z_THRESHOLD = float(os.environ.get("ANOMALY_Z_THRESHOLD", "2.0"))
+
+# Aggregation method: fedavg | krum | multi-krum
+AGGREGATION_METHOD = os.environ.get("AGGREGATION_METHOD", "fedavg").lower()
 
 
 def _load_certificates() -> Tuple[bytes, bytes, bytes]:
@@ -224,15 +246,79 @@ def _filter_anomalous_updates(
 
 
 # ---------------------------------------------------------------------------
+# Identity binding: mTLS CN → client_id cross-reference
+# ---------------------------------------------------------------------------
+
+def _load_client_cn_map(cert_dir: Path, num_clients: int) -> Dict[str, str]:
+    """Load client certificates and extract Common Name for each client_id.
+
+    Builds a mapping: { "0": "fl-client-0", "1": "fl-client-1", ... }
+    Used to cross-reference the self-reported client_id in fit() metrics
+    against the identity embedded in the mTLS certificate.
+    """
+    try:
+        from cryptography import x509
+    except ImportError:
+        print("[Identity] cryptography library not available – skipping CN map")
+        return {}
+
+    cn_map: Dict[str, str] = {}
+    for i in range(num_clients):
+        cert_path = cert_dir / f"client-{i}.crt"
+        if cert_path.exists():
+            cert_data = cert_path.read_bytes()
+            cert = x509.load_pem_x509_certificate(cert_data)
+            cn = cert.subject.get_attributes_for_oid(
+                x509.oid.NameOID.COMMON_NAME
+            )[0].value
+            cn_map[str(i)] = cn
+            print(f"[Identity] client-{i} cert CN: {cn}")
+        else:
+            print(f"[Identity] ⚠ cert not found: {cert_path}")
+    return cn_map
+
+
+def _verify_identity_binding(
+    client_id: str,
+    cn_map: Dict[str, str],
+) -> bool:
+    """Verify that a self-reported client_id has a matching certificate CN.
+
+    Returns True if binding is valid or if cn_map is empty (baseline mode).
+    """
+    if not cn_map:
+        return True  # No certs loaded (baseline/ablation mode)
+
+    if client_id not in cn_map:
+        print(f"[Identity] 🚨 REJECT: client_id={client_id} has NO "
+              f"registered certificate")
+        return False
+
+    # CN should match pattern fl-client-{id}
+    expected_cn = f"fl-client-{client_id}"
+    actual_cn = cn_map[client_id]
+    if actual_cn != expected_cn:
+        print(f"[Identity] 🚨 REJECT: client_id={client_id} cert CN "
+              f"'{actual_cn}' != expected '{expected_cn}'")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Combined Strategy: Gate 2 (Signatures) + Gate 3 (Anomaly Detection)
 # ---------------------------------------------------------------------------
 class ZeroTrustFedAvg(FedAvg):
     """FedAvg secured with signature verification AND anomaly detection.
 
     Pipeline per round:
-        Gate 2 → verify RSA-PSS signature on each update
-        Gate 3 → statistical outlier detection on verified updates
-        FedAvg → aggregate only clean, verified updates
+        Identity → verify self-reported client_id against cert CN
+        Gate 2   → verify RSA-PSS signature on each update
+        Gate 3   → statistical outlier detection on verified updates
+        Aggregate → FedAvg, Krum, or Multi-Krum on clean updates
+
+    Gate 2 and Gate 3 can be independently disabled via constructor flags
+    to support ablation studies.
     """
 
     def __init__(
@@ -240,133 +326,278 @@ class ZeroTrustFedAvg(FedAvg):
         public_keys: dict,
         z_threshold: float = 2.0,
         min_accepted: int = 1,
+        enable_gate2: bool = True,
+        enable_gate3: bool = True,
+        metrics_collector: Optional[MetricsCollector] = None,
+        aggregation_method: str = "fedavg",
+        num_attackers: int = 0,
+        cn_map: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.public_keys = public_keys
         self.z_threshold = z_threshold
         self.min_accepted = min_accepted
+        self.enable_gate2 = enable_gate2
+        self.enable_gate3 = enable_gate3
+        self._metrics = metrics_collector
+        self.aggregation_method = aggregation_method
+        self.num_attackers = num_attackers
+        self.cn_map = cn_map or {}
         # Tracks the most-recent aggregated global model for delta computation
         self._global_params: Optional[List[np.ndarray]] = None
 
     def aggregate_fit(
         self,
         server_round: int,
-        results: List[Tuple[ClientProxy, FitRes]],
-        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+        results,
+        failures,
     ):
-        if not results:
-            return None, {}
+        """Gate 2 + Gate 3 pipeline with ablation toggles and metrics."""
+        # Metric accumulators (always recorded via finally)
+        g2_passed = 0
+        g2_rejected_n = 0
+        g3_accepted_n = 0
+        g3_rejected_n = 0
+        g3_rej_cids: list = []
+        agg_skipped = True
 
-        print(f"\n{'='*60}")
-        print(f"  ROUND {server_round} – Zero-Trust Aggregation Pipeline")
-        print(f"{'='*60}")
+        try:
+            if not results:
+                return None, {}
 
-        # ── Gate 2: Signature Verification ─────────────────────────
-        print(f"\n── Gate 2: Signature Verification ──")
-        verified = []
-        gate2_rejected = 0
+            print(f"\n{'='*60}")
+            print(f"  ROUND {server_round} – Zero-Trust Aggregation Pipeline")
+            print(f"{'='*60}")
 
-        for client_proxy, fit_res in results:
-            metrics = fit_res.metrics
-            cid = str(int(metrics.get("client_id", -1)))
-            sig = metrics.get("signature", "")
-
-            if cid not in self.public_keys:
-                log(WARNING, "[Gate 2] ✗ REJECTED unknown client_id=%s", cid)
-                gate2_rejected += 1
-                continue
-
-            if not sig:
-                log(WARNING, "[Gate 2] ✗ REJECTED unsigned update from client_id=%s", cid)
-                gate2_rejected += 1
-                continue
-
-            ndarrays = parameters_to_ndarrays(fit_res.parameters)
-            if verify_signature(ndarrays, sig, self.public_keys[cid], server_round=server_round):
-                print(f"[Gate 2] ✓  Signature VALID for client-{cid}")
-                verified.append((cid, ndarrays, client_proxy, fit_res))
+            # ── Identity Binding: mTLS CN ↔ client_id ────────────────
+            identity_ok = []
+            identity_rejected = 0
+            if self.cn_map:
+                print(f"\n── Identity Binding: CN ↔ client_id ──")
+                for client_proxy, fit_res in results:
+                    metrics = fit_res.metrics
+                    cid = str(int(metrics.get("client_id", -1)))
+                    if _verify_identity_binding(cid, self.cn_map):
+                        print(f"[Identity] ✓  client-{cid} identity bound")
+                        identity_ok.append((client_proxy, fit_res))
+                    else:
+                        identity_rejected += 1
+                print(f"[Identity] Result: {len(identity_ok)} bound, "
+                      f"{identity_rejected} rejected")
             else:
-                log(WARNING, "[Gate 2] ✗ REJECTED tampered update from client_id=%s", cid)
-                gate2_rejected += 1
+                identity_ok = list(results)
 
-        print(f"[Gate 2] Result: {len(verified)} passed, {gate2_rejected} rejected")
+            # ── Gate 2: Signature Verification ───────────────────────────
+            verified = []
+            gate2_rejected = 0
 
-        if not verified:
-            log(WARNING, "[Gate 2] No valid updates – skipping aggregation")
-            return None, {}
+            if self.enable_gate2:
+                print(f"\n── Gate 2: Signature Verification ──")
+                for client_proxy, fit_res in identity_ok:
+                    metrics = fit_res.metrics
+                    cid = str(int(metrics.get("client_id", -1)))
+                    sig = metrics.get("signature", "")
 
-        # ── Gate 3: Anomaly Detection ──────────────────────────────
-        print(f"\n── Gate 3: Anomaly Detection ──")
-        if self._global_params is None:
-            print("[Gate 3] Round 1: no global reference yet – using weight-norm Z-score")
-        else:
-            print("[Gate 3] Global reference available – using delta cosine similarity")
-        accepted, gate3_rejected_cids = _filter_anomalous_updates(
-            verified, self.z_threshold, self._global_params
-        )
+                    if cid not in self.public_keys:
+                        log(WARNING, "[Gate 2] ✗ REJECTED unknown client_id=%s", cid)
+                        gate2_rejected += 1
+                        continue
 
-        gate3_rejected = len(gate3_rejected_cids)
-        print(f"[Gate 3] Result: {len(accepted)} accepted, "
-              f"{gate3_rejected} rejected {gate3_rejected_cids if gate3_rejected else ''}")
+                    if not sig:
+                        log(WARNING, "[Gate 2] ✗ REJECTED unsigned update from client_id=%s", cid)
+                        gate2_rejected += 1
+                        continue
 
-        if not accepted:
-            log(WARNING, "[Gate 3] All updates anomalous – skipping aggregation")
-            return None, {}
-        # \u2500\u2500 Minimum accepted clients guard (T3) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        if len(accepted) < self.min_accepted:
-            log(
-                WARNING,
-                "[Zero-Trust] Only %d update(s) survived the pipeline "
-                "(minimum required: %d) \u2013 skipping aggregation to prevent "
-                "single-client model domination.",
-                len(accepted),
-                self.min_accepted,
-            )
-            return None, {}
-        # ── FedAvg on clean updates ────────────────────────────────
-        print(f"\n── Aggregating {len(accepted)} clean updates via FedAvg ──")
-        agg_result = super().aggregate_fit(server_round, accepted, failures)
-        # Persist new global model for delta computation in the next round
-        if agg_result is not None and agg_result[0] is not None:
-            self._global_params = parameters_to_ndarrays(agg_result[0])
-            print(f"[Gate 3] Global model snapshot saved for round {server_round + 1}")
-        return agg_result
+                    ndarrays = parameters_to_ndarrays(fit_res.parameters)
+                    if verify_signature(ndarrays, sig, self.public_keys[cid], server_round=server_round):
+                        print(f"[Gate 2] ✓  Signature VALID for client-{cid}")
+                        verified.append((cid, ndarrays, client_proxy, fit_res))
+                    else:
+                        log(WARNING, "[Gate 2] ✗ REJECTED tampered update from client_id=%s", cid)
+                        gate2_rejected += 1
+
+                print(f"[Gate 2] Result: {len(verified)} passed, {gate2_rejected} rejected")
+            else:
+                # Gate 2 DISABLED – accept all without signature verification
+                print(f"\n── Gate 2: DISABLED (ablation) ──")
+                for client_proxy, fit_res in identity_ok:
+                    metrics = fit_res.metrics
+                    cid = str(int(metrics.get("client_id", -1)))
+                    ndarrays = parameters_to_ndarrays(fit_res.parameters)
+                    verified.append((cid, ndarrays, client_proxy, fit_res))
+                print(f"[Gate 2] DISABLED – all {len(verified)} updates accepted")
+
+            g2_passed = len(verified)
+            g2_rejected_n = gate2_rejected
+
+            if not verified:
+                log(WARNING, "[Gate 2] No valid updates – skipping aggregation")
+                return None, {}
+
+            # ── Gate 3: Anomaly Detection ──────────────────────────────
+            if self.enable_gate3:
+                print(f"\n── Gate 3: Anomaly Detection ──")
+                if self._global_params is None:
+                    print("[Gate 3] Round 1: no global reference yet – using weight-norm Z-score")
+                else:
+                    print("[Gate 3] Global reference available – using delta cosine similarity")
+                accepted, gate3_rejected_cids = _filter_anomalous_updates(
+                    verified, self.z_threshold, self._global_params
+                )
+
+                gate3_rejected = len(gate3_rejected_cids)
+                g3_rej_cids = list(gate3_rejected_cids)
+                print(f"[Gate 3] Result: {len(accepted)} accepted, "
+                      f"{gate3_rejected} rejected {gate3_rejected_cids if gate3_rejected else ''}")
+
+                if not accepted:
+                    log(WARNING, "[Gate 3] All updates anomalous – skipping aggregation")
+                    return None, {}
+            else:
+                # Gate 3 DISABLED – accept all verified updates
+                print(f"\n── Gate 3: DISABLED (ablation) ──")
+                accepted = [(cp, fr) for (_, _, cp, fr) in verified]
+                print(f"[Gate 3] DISABLED – all {len(accepted)} updates accepted")
+
+            g3_accepted_n = len(accepted)
+            g3_rejected_n = len(g3_rej_cids)
+
+            # Minimum accepted clients guard
+            if len(accepted) < self.min_accepted:
+                log(
+                    WARNING,
+                    "[Zero-Trust] Only %d update(s) survived the pipeline "
+                    "(minimum required: %d) – skipping aggregation.",
+                    len(accepted),
+                    self.min_accepted,
+                )
+                return None, {}
+
+            # ── Aggregation (FedAvg / Krum / Multi-Krum) ──────────────
+            method = self.aggregation_method
+            print(f"\n── Aggregating {len(accepted)} clean updates via {method} ──")
+
+            if method in ("krum", "multi-krum"):
+                agg_weights, total_ex = krum_aggregate(
+                    accepted,
+                    num_byzantine=self.num_attackers,
+                    multi=(method == "multi-krum"),
+                )
+                agg_params = ndarrays_to_parameters(agg_weights)
+                agg_result = (agg_params, {})
+            else:
+                # Default: FedAvg
+                agg_result = super().aggregate_fit(server_round, accepted, failures)
+
+            if agg_result is not None and agg_result[0] is not None:
+                self._global_params = parameters_to_ndarrays(agg_result[0])
+                print(f"[{method}] Global model snapshot saved for round {server_round + 1}")
+                save_round_model(self._global_params, server_round, RESULTS_DIR)
+                agg_skipped = False
+
+            return agg_result
+
+        finally:
+            if self._metrics:
+                self._metrics.record_fit(
+                    server_round,
+                    gate2_passed=g2_passed,
+                    gate2_rejected=g2_rejected_n,
+                    gate3_accepted=g3_accepted_n,
+                    gate3_rejected=g3_rejected_n,
+                    gate3_rejected_cids=g3_rej_cids,
+                    aggregation_skipped=agg_skipped,
+                    aggregation_method=self.aggregation_method,
+                    num_clients_reporting=len(results) if results else 0,
+                )
+
+    # Override aggregate_evaluate to capture per-round accuracy
+    def aggregate_evaluate(self, server_round, results, failures):
+        result = super().aggregate_evaluate(server_round, results, failures)
+        if result is not None and self._metrics:
+            loss, mets = result
+            if loss is not None:
+                acc = mets.get("accuracy")
+                self._metrics.record_eval(
+                    server_round, loss, acc if acc is not None else 0.0,
+                )
+        return result
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # ── Reproducibility ────────────────────────────────────────────────
+    if SEED >= 0:
+        set_seed(SEED)
+        print(f"[SERVER] Seed set to {SEED}")
+
     # Gate 2: Load client public keys
     public_keys = load_client_public_keys(SIGNING_KEY_DIR, NUM_CLIENTS)
 
     # Gate 3: Configurable Z-score threshold
     print(f"[Gate 3] Anomaly Z-score threshold: {ANOMALY_Z_THRESHOLD}")
+    print(f"[SERVER] Gate 2 (signatures): {'ENABLED' if ENABLE_GATE2 else 'DISABLED'}")
+    print(f"[SERVER] Gate 3 (anomaly):    {'ENABLED' if ENABLE_GATE3 else 'DISABLED'}")
+    print(f"[SERVER] Aggregation method:  {AGGREGATION_METHOD}")
 
     MIN_CLIENTS = int(os.environ.get("MIN_CLIENTS", str(NUM_CLIENTS)))
     MIN_ACCEPTED = int(os.environ.get("MIN_ACCEPTED", "2"))
+    NUM_ATTACKERS = int(os.environ.get("NUM_ATTACKERS", "0"))
+
+    # ── Identity binding: load client certificate CNs ──────────────────
+    cn_map = _load_client_cn_map(CERT_DIR, NUM_CLIENTS) if ENABLE_GATE2 else {}
+
+    # ── Metrics collector ──────────────────────────────────────────────
+    mc = MetricsCollector()
 
     strategy = ZeroTrustFedAvg(
         public_keys=public_keys,
         z_threshold=ANOMALY_Z_THRESHOLD,
         min_accepted=MIN_ACCEPTED,
+        enable_gate2=ENABLE_GATE2,
+        enable_gate3=ENABLE_GATE3,
+        metrics_collector=mc,
+        aggregation_method=AGGREGATION_METHOD,
+        num_attackers=NUM_ATTACKERS,
+        cn_map=cn_map,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=MIN_CLIENTS,
         min_evaluate_clients=MIN_CLIENTS,
         min_available_clients=MIN_CLIENTS,
         on_fit_config_fn=lambda server_round: {"server_round": server_round},
+        evaluate_metrics_aggregation_fn=weighted_eval_metrics,
     )
 
     # Gate 1: Load mTLS certificates
     certificates = _load_certificates()
 
+    print(f"[SERVER] Rounds: {NUM_ROUNDS}")
+
     fl.server.start_server(
         server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=3),
+        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
         certificates=certificates,
+    )
+
+    # ── Save structured metrics ────────────────────────────────────────
+    mc.save(
+        RESULTS_DIR / "metrics.json",
+        metadata={
+            "seed": SEED,
+            "num_rounds": NUM_ROUNDS,
+            "num_clients": NUM_CLIENTS,
+            "enable_gate1": True,
+            "enable_gate2": ENABLE_GATE2,
+            "enable_gate3": ENABLE_GATE3,
+            "z_threshold": ANOMALY_Z_THRESHOLD,
+            "aggregation_method": AGGREGATION_METHOD,
+            "num_attackers": NUM_ATTACKERS,
+        },
     )
 
 

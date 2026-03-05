@@ -34,16 +34,15 @@
     - 9.3 [Training Configuration](#93-training-configuration)
     - 9.4 [Aggregation Strategy](#94-aggregation-strategy)
 10. [Component Deep Dive — The "Why" & "How"](#10-component-deep-dive--the-why--how)
-    - 10.1  [`generate_certs.sh` — The Foundation of Trust](#101-generate_certssh--the-foundation-of-trust)
-    - 10.2  [`generate_signing_keys.sh` — Gate 2 Key Material](#102-generate_signing_keyssh--gate-2-key-material)
-    - 10.3  [`model.py` — The Neural Network](#103-modelpy--the-neural-network)
-    - 10.4  [`signing.py` — The Cryptographic Core](#104-signingpy--the-cryptographic-core)
-    - 10.5  [`client.py` — The Honest Participant](#105-clientpy--the-honest-participant)
-    - 10.6  [`server.py` — The Zero-Trust Aggregator](#106-serverpy--the-zero-trust-aggregator)
-    - 10.7  [`client_malicious.py` — The Adversarial Proof](#107-client_maliciouspy--the-adversarial-proof)
-    - 10.8  [Shared Modules — `data_utils.py`, `training.py`, `mtls.py`](#108-shared-modules--data_utilspy-trainingpy-mtlspy)
-    - 10.9  [`Dockerfile` — Reproducible Environment](#109-dockerfile--reproducible-environment)
-    - 10.10 [`docker-compose.yml` — Orchestration and Isolation](#1010-docker-composeyml--orchestration-and-isolation)
+    - 10.1  [`generate_keys.py` — Cryptographic Material Generation](#101-generate_keyspy--cryptographic-material-generation)
+    - 10.2  [`model.py` — The Neural Network](#102-modelpy--the-neural-network)
+    - 10.3  [`signing.py` — The Cryptographic Core](#103-signingpy--the-cryptographic-core)
+    - 10.4  [`client.py` — The Honest Participant](#104-clientpy--the-honest-participant)
+    - 10.5  [`server.py` — The Zero-Trust Aggregator](#105-serverpy--the-zero-trust-aggregator)
+    - 10.6  [`client_malicious.py` — The Adversarial Proof](#106-client_maliciouspy--the-adversarial-proof)
+    - 10.7  [Shared Modules — `data_utils.py`, `training.py`, `mtls.py`, `server_utils.py`](#107-shared-modules--data_utilspy-trainingpy-mtlspy-server_utilspy)
+    - 10.8  [`Dockerfile` — Reproducible Environment](#108-dockerfile--reproducible-environment)
+    - 10.9  [`docker-compose.yml` — Orchestration and Isolation](#109-docker-composeyml--orchestration-and-isolation)
 11. [Infrastructure & Deployment](#11-infrastructure--deployment)
     - 11.1 [Docker Image](#111-docker-image)
     - 11.2 [Docker Compose Orchestration](#112-docker-compose-orchestration)
@@ -181,8 +180,8 @@ Additionally, the PKI infrastructure feeds trust material into the runtime conta
 ```mermaid
 graph TB
     subgraph "PKI Infrastructure (Pre-deployment)"
-        CA["🔐 Root CA<br/><i>generate_certs.sh</i>"]
-        SK["🔑 RSA Key Pairs<br/><i>generate_signing_keys.sh</i>"]
+        CA["🔐 Root CA<br/><i>generate_keys.py</i>"]
+        SK["🔑 RSA Key Pairs<br/><i>generate_keys.py</i>"]
     end
 
     subgraph "Docker Network (Runtime)"
@@ -289,7 +288,7 @@ sequenceDiagram
 
     rect rgb(220, 255, 220)
         Note over C0: Honest Local Training
-        C0->>C0: Train 1 epoch on IID CIFAR-10 partition
+        C0->>C0: Train 1 epoch on Dirichlet-partitioned CIFAR-10
         C0->>C0: sign_parameters(weights, private_key, round)
     end
 
@@ -378,16 +377,22 @@ ZT-Pipeline/
 │
 ├── model.py                  # CifarCNN – shared model definition
 ├── server.py                 # Flower server + ZeroTrustFedAvg strategy
+├── server_utils.py           # Shared server utilities (Krum, metrics, model saving)
 ├── client.py                 # Honest Flower client (train + sign + send)
 ├── client_malicious.py       # Adversarial client (label_flip / targeted / noise / scale)
 ├── signing.py                # RSA-PSS sign/verify utilities (replay-protected)
 │
-├── data_utils.py             # Shared CIFAR-10 loading and IID partitioning
+├── data_utils.py             # CIFAR-10 loading, Dirichlet partitioning, DataLoader factory
 ├── training.py               # Shared training, evaluation, GPU config, hyperparams
 ├── mtls.py                   # Shared mTLS certificate loading and gRPC patching
 │
-├── generate_certs.sh         # OpenSSL PKI generation (mTLS certs)
-├── generate_signing_keys.sh  # OpenSSL RSA key pair generation (signing)
+├── generate_keys.py          # Generates mTLS certs (Gate 1) and RSA signing keys (Gate 2)
+│
+├── run_experiments.py        # Primary orchestrator (multi-seed, multi-config)
+├── run_experiment.py         # Single-run orchestrator (legacy)
+├── verify_system_deployment.py # Pre-flight deployment checks
+├── tracking/
+│   └── mlflow_logger.py        # MLflow ExperimentTracker + NullTracker wrappers
 │
 ├── Dockerfile                # CUDA 12.4 + PyTorch + Flower image
 ├── docker-compose.yml        # Orchestration: server + clients + attacker
@@ -424,11 +429,11 @@ ZT-Pipeline/
 | `client.py` | ~140 | Flower client entry point. **Deny-by-default**: crashes without mTLS certs or signing key. Uses shared modules for training (AMP, TF32), mTLS, and data loading. Signs updates with round-bound replay nonce. |
 | `client_malicious.py` | ~200 | Adversarial client supporting four attack modes: `label_flip`, `targeted`, `noise`, and `scale`. Holds valid mTLS cert and signing key — designed to pass Gates 1 & 2 but fail Gate 3 (delta-cosine / Z-score detection). |
 | `signing.py` | ~185 | Utility module: deterministic weight serialization (`numpy.save`), SHA-256 pre-hashing, RSA-PSS sign/verify with **round-bound replay protection**, key I/O. Catches only `InvalidSignature` (not broad `Exception`). |
-| `data_utils.py` | ~50 | Shared CIFAR-10 loading (`get_cifar10()`) and IID partitioning (`partition_data()`). Eliminates duplication across all client files. |
+| `data_utils.py` | ~80 | CIFAR-10 loading, Dirichlet-α partitioning (`partition_data()`), `make_dataloaders()` factory, and label-flip helpers (`flip_labels_global`, `flip_labels_targeted`). Eliminates duplication across all client files. |
 | `training.py` | ~130 | Shared GPU configuration (TF32, matmul precision), hyperparameters, `train_one_epoch()` with AMP, `evaluate()`, `get_parameters()`/`set_parameters()`, `create_model()` with `torch.compile`. |
 | `mtls.py` | ~45 | Shared mTLS helpers: `load_client_certificates()` and `patch_grpc_for_mtls()`. Used by all ZT client files. |
-| `generate_certs.sh` | ~90 | Bash/OpenSSL script: creates Root CA (4096-bit RSA), signs server + 2 client certificates with SAN extensions. |
-| `generate_signing_keys.sh` | ~55 | Bash/OpenSSL script: generates PKCS#8 RSA-2048 key pairs for each client (default: 2). |
+| `server_utils.py` | ~120 | Shared server utilities extracted from both servers: `json_safe`, `weighted_eval_metrics`, `krum_scores`, `krum_aggregate`, `save_round_model`, `MetricsCollector`. |
+| `generate_keys.py` | ~80 | Python script using the `cryptography` library: creates Root CA (4096-bit RSA), signs server + client certificates with SAN extensions, generates PKCS#8 RSA-2048 key pairs for each client. Replaces the former `generate_certs.sh` + `generate_signing_keys.sh` bash scripts. |
 
 ---
 
@@ -515,8 +520,8 @@ def _patch_grpc_for_mtls(ca_cert, client_cert, client_key):
 
 #### Certificate Generation
 
-```bash
-bash generate_certs.sh
+```powershell
+python generate_keys.py
 ```
 
 Produces the `certs/` directory with all certificates and keys.
@@ -619,8 +624,8 @@ client-0:
 
 The client's `__init__()` raises a `RuntimeError` if the signing key is missing — an unsigned client cannot participate.
 
-```bash
-bash generate_signing_keys.sh
+```powershell
+python generate_keys.py
 ```
 
 Produces 2048-bit RSA key pairs in PKCS#8 PEM format.
@@ -754,18 +759,18 @@ This architecture can be replaced with any PyTorch model without modifying the s
 
 ### 9.2 Data Partitioning
 
-CIFAR-10 is partitioned using a simple **IID (Independent and Identically Distributed)** split:
+CIFAR-10 is partitioned using a **Dirichlet distribution** (concentration parameter $\alpha$, default `0.5`) to simulate realistic heterogeneous data across clients:
 
 - Total training samples: 50,000
-- With $N$ clients, each receives $\lfloor 50000 / N \rfloor$ consecutive samples
+- Higher $\alpha$ (→ ∞) approaches IID; lower $\alpha$ (→ 0) creates extreme skew
 - Test set (10,000 samples) is shared across all clients for evaluation
 
 ```python
-def partition_data(train_set, num_clients, client_id):
-    shard_size = len(train_set) // num_clients
-    start = client_id * shard_size
-    indices = list(range(start, start + shard_size))
-    return Subset(train_set, indices)
+def partition_data(train_set, num_clients, client_id, dirichlet_alpha=0.5, seed=42):
+    rng = np.random.default_rng(seed)
+    targets = np.array(train_set.targets)
+    proportions = rng.dirichlet([dirichlet_alpha] * num_clients, size=NUM_CLASSES)
+    # ... assign indices per class according to proportions
 ```
 
 ### 9.3 Training Configuration
@@ -823,60 +828,37 @@ where $n_k$ is the number of training samples on client $k$ and $K$ is the numbe
 
 This section goes beyond summarizing each file. It explains the **critical logic** — the specific design decisions that, when questioned by a professor, need a clear and defensible answer.
 
-### 10.1 `generate_certs.sh` — The Foundation of Trust
+### 10.1 `generate_keys.py` — Cryptographic Material Generation
 
-**What it does:** Creates a complete Public Key Infrastructure (PKI) with a single Root Certificate Authority.
+**What it does:** In a single Python invocation, produces all cryptographic material required by the three-gate pipeline.
 
-**Why it matters:** Without this, there is no Gate 1. The entire mTLS chain depends on every certificate being traceable to the same CA.
+**Why Python instead of Bash?** The original prototype used two shell scripts (`generate_certs.sh` + `generate_signing_keys.sh`). These were consolidated into a single cross-platform Python script using the `cryptography` library because:
+- Windows hosts do not have OpenSSL on `PATH` by default
+- A single script reduces setup friction (one command, no WSL2 dependency)
+- Dependencies are already present in `requirements.txt`
+- Error handling and output validation are cleaner
 
-**Critical logic:**
+**What it generates:**
 
-```bash
-openssl req -new -x509 \
-    -key "${CERT_DIR}/ca.key" \
-    -out "${CERT_DIR}/ca.crt" \
-    -days 365 \
-    -subj "/C=US/ST=Research/O=ZT-Pipeline/CN=FL-Root-CA"
-```
+| Artifact | Location | Used By |
+|---|---|---|
+| `ca.crt` / `ca.key` | `certs/` | All containers (trust anchor); CA key is **offline only** |
+| `server.crt` / `server.key` | `certs/` | Server container (Gate 1 identity) |
+| `client-{id}.crt` / `client-{id}.key` | `certs/` | Respective client container (Gate 1 identity) |
+| `client-{id}.private.pem` | `signing_keys/` | Respective client only (Gate 2 signing) |
+| `client-{id}.public.pem` | `signing_keys/` | Server only (Gate 2 verification) |
 
-This generates the **self-signed Root CA** — the ultimate trust anchor. Both the server and clients will validate each other's certificates by checking: *"Was this cert signed by a CA I trust?"*
+**Critical logic — SAN extensions:**
 
-**SAN (Subject Alternative Names) — the subtle but vital detail:**
-
-```bash
-generate_cert "server" "fl-server" \
-    "DNS:server,DNS:fl-server,DNS:localhost,IP:127.0.0.1"
-```
-
-The `DNS:server` SAN entry matches the Docker Compose service name `server`. When clients connect to `server:8080`, gRPC validates the server certificate's SAN against the hostname. Without this, the TLS handshake fails with a hostname mismatch — a common deployment pitfall.
+Every certificate includes Subject Alternative Names that match Docker Compose service names (e.g., `DNS:server`). When a Flower client dials `server:8080`, gRPC validates the server certificate CN/SAN against the hostname. Without the `DNS:server` entry the TLS handshake fails with a hostname mismatch.
 
 **Produced artifacts:**
 
-| File | Held By | Purpose |
-|---|---|---|
-| `ca.crt` | Server + all clients | Trust anchor — "Who issued valid certs?" |
-| `ca.key` | **Offline only** (not mounted) | CA signing key — never in containers |
-| `server.crt` / `server.key` | Server | Server's identity proof |
-| `client-{id}.crt` / `client-{id}.key` | Respective client only | Client identity proof |
-
-> **Zero-Trust principle enforced:** The CA private key (`ca.key`) is deliberately *not* mounted into any Docker container. It exists only for the offline cert-generation step. If a container is compromised, the attacker cannot mint new certificates.
+> **Zero-Trust principle enforced:** The CA private key (`ca.key`) is **not** mounted into any Docker container. It exists only during the offline key-generation step. If a container is compromised, the attacker cannot mint new certificates.
 
 ---
 
-### 10.2 `generate_signing_keys.sh` — Gate 2 Key Material
-
-**What it does:** Generates RSA-2048 key pairs for each client. Private keys stay with clients; public keys are shared with the server.
-
-**Why separate from mTLS certs?** This is a *separation of concerns* design:
-
-- **mTLS certificates** (Gate 1) prove *who you are* at the transport layer.
-- **Signing keys** (Gate 2) prove *that you authored this specific model update* at the application layer.
-
-Even if the TLS connection is somehow MitM'd or replayed (theoretical), the signature binds the exact bytes of the model update to the specific client key and round number. This is **defense-in-depth**: one compromised layer doesn't compromise the other.
-
----
-
-### 10.3 `model.py` — The Neural Network
+### 10.2 `model.py` — The Neural Network
 
 **Architecture:**
 
@@ -894,7 +876,7 @@ Input (3×32×32) → Conv(3→32)+ReLU+Pool → Conv(32→64)+ReLU+Pool
 
 ---
 
-### 10.4 `signing.py` — The Cryptographic Core
+### 10.3 `signing.py` — The Cryptographic Core
 
 This file implements both sides of Gate 2: **client-side signing** and **server-side verification**.
 
@@ -941,7 +923,7 @@ signature = private_key.sign(
 
 ---
 
-### 10.5 `client.py` — The Honest Participant
+### 10.4 `client.py` — The Honest Participant
 
 #### 10.5.1 mTLS Certificate Loading (Lines 170–193)
 
@@ -1032,7 +1014,7 @@ If either mTLS certs or signing keys are missing, the client **crashes immediate
 
 ---
 
-### 10.6 `server.py` — The Zero-Trust Aggregator
+### 10.5 `server.py` — The Zero-Trust Aggregator
 
 #### 10.6.1 `ZeroTrustFedAvg` Strategy (Lines 203–238)
 
@@ -1156,7 +1138,7 @@ When `certificates` is passed to `start_server()`, Flower creates a gRPC server 
 
 ---
 
-### 10.7 `client_malicious.py` — The Adversarial Proof
+### 10.6 `client_malicious.py` — The Adversarial Proof
 
 **Purpose in the thesis:** This file is *not* a vulnerability — it's a **controlled experiment** that proves Gate 3 is necessary.
 
@@ -1187,11 +1169,11 @@ Because the malicious delta points in the **opposite direction** to the honest o
 
 ---
 
-### 10.8 Shared Modules — `data_utils.py`, `training.py`, `mtls.py`
+### 10.7 Shared Modules — `data_utils.py`, `training.py`, `mtls.py`, `server_utils.py`
 
 These modules eliminate code duplication across the client files:
 
-- **`data_utils.py`:** CIFAR-10 download/transform and IID partitioning — previously copy-pasted in every client.
+- **`data_utils.py`:** CIFAR-10 loading and Dirichlet-α partitioning; `make_dataloaders()` factory that encapsulates shard selection, transforms, and `DataLoader` construction with `pin_memory` and `persistent_workers`; `flip_labels_global`/`flip_labels_targeted` helpers shared across all malicious clients.
 - **`training.py`:** Device detection, GPU config (TF32, matmul precision), hyperparameters (`BATCH_SIZE`, `LEARNING_RATE`, `LOCAL_EPOCHS`), `train_one_epoch()` with AMP, `evaluate()` with autocast, `get_parameters()`/`set_parameters()`, `create_model()` with `torch.compile`, and `train_one_epoch_with_label_transform()` for attack modes.
 - **`mtls.py`:** `load_client_certificates()` reads CA cert, client cert, and client key; `patch_grpc_for_mtls()` monkey-patches Flower's gRPC channel to inject TLS credentials.
 
@@ -1199,7 +1181,7 @@ These modules eliminate code duplication across the client files:
 
 ---
 
-### 10.9 `Dockerfile` — Reproducible Environment
+### 10.8 `Dockerfile` — Reproducible Environment
 
 ```dockerfile
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
@@ -1219,9 +1201,9 @@ PyTorch is installed from the CUDA 12.4 wheel index to match the base image's CU
 
 ---
 
-### 10.10 `docker-compose.yml` — Orchestration and Isolation
+### 10.9 `docker-compose.yml` — Orchestration and Isolation
 
-#### 10.10.1 Service Architecture
+#### 10.9.1 Service Architecture
 
 | Service | Role | Always On? |
 |---|---|---|
@@ -1363,8 +1345,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 nvidia-s
 cd D:\Z\Master\Code\Exp\ZT-Pipeline
 
 # Generate cryptographic material
-bash generate_certs.sh
-bash generate_signing_keys.sh
+python generate_keys.py
 
 # Build and run
 docker compose build
@@ -1455,8 +1436,8 @@ This section maps specific thesis claims to **exact code evidence** — designed
 | **Server passes certificates to Flower, enabling TLS + client cert verification** | `server.py` → `main()`, line `fl.server.start_server(..., certificates=certificates)` |
 | **Client fails fatally if certs are missing** | `client.py` → `main()`, line `raise RuntimeError(...)` |
 | **Client patches gRPC to present its cert to server** | `client.py` → `_patch_grpc_for_mtls()` lines 195–215 |
-| **Certificate chain traces to shared CA** | `generate_certs.sh` → `openssl x509 -req ... -CA ca.crt -CAkey ca.key` |
-| **Each client cert is unique (CN=fl-client-{id})** | `generate_certs.sh` lines 87–93 |
+| **Certificate chain traces to shared CA** | `generate_keys.py` — `cryptography.x509` CA signs all certs |
+| **Each client cert is unique (CN=fl-client-{id})** | `generate_keys.py` — per-client `CommonName` and SAN |
 | **Certs mounted read-only, private keys isolated per-container** | `docker-compose.yml` → volume mounts with `:ro` |
 
 ### Claim 2: "The system verifies the integrity of every model update" (Gate 2)
@@ -1601,7 +1582,7 @@ The implementation does not include Differential Privacy, and here's why this is
 
 - `NUM_CLIENTS` is fixed at startup via environment variable.
 - The server pre-loads exactly `NUM_CLIENTS` public signing keys.
-- mTLS certificates must be pre-generated by `generate_certs.sh`.
+- mTLS certificates must be pre-generated by `generate_keys.py`.
 
 A new client would need: (a) a CA-signed TLS certificate, (b) an RSA signing key pair with the public key deployed to the server, and (c) the server restarted with an updated `NUM_CLIENTS`. This is a Zero-Trust design choice: **no client can join without explicit pre-authorization**. Dynamic enrollment would require a registration authority component (a future extension).
 
@@ -1614,13 +1595,13 @@ A new client would need: (a) a CA-signed TLS certificate, (b) an RSA signing key
 | Limitation | Description | Mitigation Path |
 |-----------|-------------|----------------|
 | **Single-machine simulation** | All containers share one GPU; does not test real network latency or bandwidth constraints | Deploy to a multi-node Kubernetes cluster with actual edge devices |
-| **IID data partition** | Real-world FL data is typically non-IID, which affects both convergence and anomaly detection | Implement Dirichlet-based non-IID partitioning |
+| **IID data partition** | Real-world FL data is typically non-IID, affecting both convergence and anomaly detection — **addressed**: `data_utils.py` now uses Dirichlet-α partitioning (configurable via `DIRICHLET_ALPHA`) | Experiment matrix covers $\alpha = 0.1, 0.5, 1.0$ |
 | **Static PKI** | Certificates and signing keys are generated once and mounted statically; no revocation mechanism | Implement certificate rotation and an OCSP/CRL revocation mechanism |
 | **Self-reported client_id** | Gate 1 (mTLS CN) and Gate 2 (`client_id` in metrics) are not cross-referenced; a client could claim a different ID | Extract CN from mTLS peer certificate at the gRPC interceptor level and enforce binding with the self-reported `client_id` |
 | **Monkey-patched gRPC** | Client mTLS is achieved by monkey-patching `grpc.ssl_channel_credentials` — fragile and thread-unsafe | Upstream contribution to Flower or use a custom gRPC transport layer; Flower 1.14+ may expose direct mTLS config |
 | **No differential privacy** | Model updates may still leak information about the training data | Add DP-SGD (e.g., `opacus` library) for $(\varepsilon, \delta)$-differential privacy |
 | **No audit logging** | Security events are printed to stdout but not persisted | Integrate structured logging (JSON) with a SIEM or ELK stack |
-| **2048-bit signing keys** | NIST recommends ≥3072-bit RSA for protection beyond 2030 | Upgrade `generate_signing_keys.sh` to 3072-bit or migrate to Ed25519 |
+| **2048-bit signing keys** | NIST recommends ≥3072-bit RSA for protection beyond 2030 | Upgrade `generate_keys.py` to 3072-bit or migrate to Ed25519 |
 
 ### Future Work Extensions
 
@@ -1636,11 +1617,11 @@ A new client would need: (a) a CA-signed TLS certificate, (b) an RSA signing key
 
 6. **Continuous Monitoring Dashboard:** Build a Grafana dashboard consuming structured logs from the pipeline, visualizing per-round: norms, cosine similarities, acceptance rates, accuracy trends.
 
-7. **Non-IID Partition Experiments:** Test Gate 3's false positive rate under varying levels of data heterogeneity (Dirichlet $\alpha = 0.1, 0.5, 1.0$).
+7. **Non-IID Partition Experiments (✔ implemented):** Dirichlet-α partitioning is active. Experiment matrix covers $\alpha = 0.1, 0.5, 1.0$ to quantify Gate 3's false positive rate under increasing data heterogeneity.
 
 8. **Model-Agnostic Design:** Validate the pipeline with larger models (ResNet-18, EfficientNet) and different datasets (FEMNIST, Shakespeare) to confirm that the security gates generalize.
 
-9. **Stronger Signing Keys:** Migrate from 2048-bit RSA to 3072-bit RSA or Ed25519 for post-2030 compliance per NIST SP 800-57.
+9. **Stronger Signing Keys:** Migrate from 2048-bit RSA to 3072-bit RSA or Ed25519 for post-2030 compliance per NIST SP 800-57. Update `generate_keys.py` key-size parameter.
 
 ---
 
